@@ -42,6 +42,16 @@ python3 main.py
 
 `main.py` automatically re-executes itself with the `.venv` interpreter if PySide6 isn't found in the system Python, so `python3 main.py` works regardless of whether the venv is activated.
 
+## Building an AppImage
+
+A portable, self-contained `SLMS-x86_64.AppImage` (no `.venv`/system Python required to run it) can be built manually:
+
+```bash
+./packaging/build_appimage.sh
+```
+
+Output: `dist/SLMS-x86_64.AppImage`. This is a manual, on-demand build (no CI) — rerun it yourself whenever you want an updated AppImage. The script installs PyInstaller into `.venv` if missing, downloads `appimagetool` on first run (cached in `packaging/`), and packages `main.py` plus the icon/`.desktop` file from `packaging/`.
+
 ## Data locations
 
 - Library database: `music_db/library.db` (inside the project directory).
@@ -69,6 +79,10 @@ music_sync/
     album_edit_dialog.py      album-wide tag editor (Next/Previous album)
     settings_dialog.py        templates, language, theme
     theme.py                  light/dark/auto palette handling
+packaging/
+  build_appimage.sh           manual AppImage build script
+  make_icon.py                generates packaging/icon.png
+  slms.desktop                .desktop entry used inside the AppImage
 ```
 
 ---
@@ -115,6 +129,16 @@ python3 main.py
 
 `main.py` automatycznie przełącza się na interpreter z `.venv`, jeśli PySide6 nie jest dostępne w systemowym Pythonie — więc `python3 main.py` działa niezależnie od tego, czy venv jest aktywowany.
 
+## Budowanie AppImage
+
+Przenośny, samodzielny plik `SLMS-x86_64.AppImage` (nie wymaga `.venv` ani systemowego Pythona do uruchomienia) można zbudować ręcznie:
+
+```bash
+./packaging/build_appimage.sh
+```
+
+Wynik: `dist/SLMS-x86_64.AppImage`. To budowanie ręczne, na żądanie (bez CI) — uruchamiaj skrypt samodzielnie za każdym razem, gdy chcesz zaktualizowany AppImage. Skrypt instaluje PyInstaller w `.venv` jeśli go brakuje, pobiera `appimagetool` przy pierwszym uruchomieniu (cache w `packaging/`) i pakuje `main.py` wraz z ikoną/plikiem `.desktop` z `packaging/`.
+
 ## Lokalizacja danych
 
 - Baza biblioteki: `music_db/library.db` (w katalogu projektu).
@@ -142,4 +166,8 @@ music_sync/
     album_edit_dialog.py      edytor tagów albumu (Następny/Poprzedni album)
     settings_dialog.py        szablony, język, motyw
     theme.py                  obsługa palety jasny/ciemny/auto
+packaging/
+  build_appimage.sh           skrypt do ręcznego budowania AppImage
+  make_icon.py                generuje packaging/icon.png
+  slms.desktop                plik .desktop używany wewnątrz AppImage
 ```

@@ -4,3 +4,5 @@ __pycache__/
 music_db/
 PROJECT.md
 .claude/
+dist/
+packaging/
