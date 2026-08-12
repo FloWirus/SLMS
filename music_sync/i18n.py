@@ -1,0 +1,271 @@
+_current_language = "en"
+
+TRANSLATIONS = {
+    "en": {
+        "language_name": "English",
+        "status_choose_directory": "Select a music directory to get started.",
+        "tab_table": "Table",
+        "tab_tree": "Tree",
+        "btn_choose_dir": "Choose source directory…",
+        "btn_rescan": "Rescan",
+        "label_target_device": "Target device:",
+        "btn_refresh_devices": "Refresh devices",
+        "btn_sync": "Sync →",
+        "btn_eject": "Eject",
+        "btn_settings": "Settings",
+        "msg_eject_success_title": "Device ejected",
+        "msg_eject_success_text": "The device can now be safely removed.",
+        "msg_eject_failed_title": "Eject failed",
+        "msg_eject_failed_text": "Could not safely eject the device:\n{error}",
+        "tree_header_name": "Artist / Album / Track",
+        "tree_header_year": "Year",
+        "tree_header_format": "Format",
+        "dialog_choose_dir_title": "Select music directory",
+        "msg_no_directory_title": "No directory",
+        "msg_no_directory_text": "First choose a source music directory.",
+        "status_loaded_library": "Loaded saved library: {count} tracks in {path} (click “Rescan” to refresh).",
+        "progress_scanning_title": "Scanning",
+        "progress_scanning_label_initial": "Scanning library…",
+        "progress_cancel": "Cancel",
+        "progress_scanning_label": "Scanning ({index}/{total}): {name}",
+        "status_scan_cancelled": "Scan cancelled — {count} tracks processed so far were saved.",
+        "status_scan_done": "Found {count} tracks in {path}",
+        "unknown_artist": "Unknown artist",
+        "unknown_album": "Unknown album",
+        "device_none": "— none —",
+        "msg_no_library_title": "No library",
+        "msg_no_library_text": "First choose and scan a source directory.",
+        "sync_whole_library": "the whole library",
+        "msg_no_device_title": "No device",
+        "msg_no_device_text": "Select a target device from the list.",
+        "confirm_sync_title": "Confirm sync",
+        "confirm_sync_text": "Copy {description} to device {mount}?",
+        "progress_sync_title": "Syncing",
+        "progress_sync_label_initial": "Syncing…",
+        "progress_sync_label": "Copying ({index}/{total}): {name}",
+        "conflict_title": "File conflict",
+        "conflict_text": "The file on the device differs from the source:\n{path}\n\nOverwrite?",
+        "sync_done_title": "Sync finished",
+        "sync_result_copied": "Copied",
+        "sync_result_present": "Already present",
+        "sync_result_skipped": "Skipped",
+        "sync_result_errors": "Errors",
+        "menu_edit_tags": "Edit tags…",
+        "menu_sync_track": "Sync this track…",
+        "menu_delete_from_device": "Delete from device only",
+        "sync_track_description": "track “{title}”",
+        "menu_sync_album": "Sync album “{album}”…",
+        "menu_sync_artist": "Sync artist “{artist}”…",
+        "sync_album_description": "album “{album}”",
+        "sync_artist_description": "artist “{artist}”",
+        "menu_edit_album_tags": "Edit album tags “{album}”…",
+        "confirm_delete_device_title": "Delete from device",
+        "confirm_delete_device_text": "Delete '{title}' from device {mount} only?\nThe source file will remain untouched.",
+        "field_artist": "Artist:",
+        "field_album": "Album:",
+        "field_title": "Title:",
+        "field_track": "Track number:",
+        "field_track_total": "Tracks in album:",
+        "field_disc": "Disc number:",
+        "field_year": "Year:",
+        "field_genre": "Genre:",
+        "field_filename": "Filename:",
+        "btn_change_cover": "Change cover…",
+        "btn_prev": "◀ Previous",
+        "btn_next": "Next ▶",
+        "btn_save_close": "Save and close",
+        "btn_cancel": "Cancel",
+        "cover_none": "No cover",
+        "dialog_choose_cover_title": "Select cover",
+        "images_filter": "Images (*.jpg *.jpeg *.png)",
+        "error_save_title": "Save error",
+        "error_file_exists": "File {name} already exists",
+        "dialog_title_edit_tags": "Edit tags — {filename}",
+        "dialog_title_edit_album": "Edit album tags — {album} ({count} tracks)",
+        "info_apply_to_all": "Changes will be applied to all {count} tracks in this album.",
+        "btn_change_cover_album": "Change cover for the whole album…",
+        "btn_prev_album": "◀ Previous album",
+        "btn_next_album": "Next album ▶",
+        "dialog_title_settings": "Settings",
+        "label_dir_template": "Directory structure on device:",
+        "label_filename_template": "Filename on device:",
+        "btn_tag_help": "Tag hints…",
+        "tag_help_title": "Available tags",
+        "tag_help_text": (
+            "Available tags (values are read from the file's audio tags):\n\n"
+            "{artist}       — artist\n"
+            "{album}        — album\n"
+            "{title}        — track title\n"
+            "{track}        — track number, zero-padded to 2 digits (1 → 01)\n"
+            "{track_total}  — number of tracks in the album, zero-padded to 2 digits\n"
+            "{disc}         — disc number\n"
+            "{year}         — release year\n"
+            "{genre}        — genre\n\n"
+            "You can also add fixed text, e.g.:\n"
+            "music/{artist}\n"
+            "{track}. {artist} - {title}"
+        ),
+        "label_language": "Language:",
+        "label_theme": "Theme:",
+        "theme_light": "Light",
+        "theme_dark": "Dark",
+        "theme_auto": "Auto (system)",
+        "btn_save": "Save",
+        "msg_restart_required": "The app must be restarted for the new language to take effect.",
+        "col_artist": "Artist",
+        "col_album": "Album",
+        "col_disc": "Disc",
+        "col_title": "Title",
+        "col_track": "No.",
+        "col_track_total": "Track count",
+        "col_year": "Year",
+        "col_genre": "Genre",
+        "col_format": "Format",
+        "col_size": "Size",
+    },
+    "pl": {
+        "language_name": "Polski",
+        "status_choose_directory": "Wybierz katalog z muzyką, aby rozpocząć.",
+        "tab_table": "Tabela",
+        "tab_tree": "Drzewo",
+        "btn_choose_dir": "Wybierz katalog źródłowy…",
+        "btn_rescan": "Skanuj ponownie",
+        "label_target_device": "Nośnik docelowy:",
+        "btn_refresh_devices": "Odśwież nośniki",
+        "btn_sync": "Synchronizuj →",
+        "btn_eject": "Wysuń",
+        "btn_settings": "Ustawienia",
+        "msg_eject_success_title": "Nośnik wysunięty",
+        "msg_eject_success_text": "Nośnik można teraz bezpiecznie odłączyć.",
+        "msg_eject_failed_title": "Nie udało się wysunąć",
+        "msg_eject_failed_text": "Nie udało się bezpiecznie wysunąć nośnika:\n{error}",
+        "tree_header_name": "Artysta / Album / Utwór",
+        "tree_header_year": "Rok",
+        "tree_header_format": "Format",
+        "dialog_choose_dir_title": "Wybierz katalog z muzyką",
+        "msg_no_directory_title": "Brak katalogu",
+        "msg_no_directory_text": "Najpierw wybierz katalog źródłowy z muzyką.",
+        "status_loaded_library": "Wczytano zapisaną bibliotekę: {count} utworów w {path} (kliknij „Skanuj ponownie”, aby odświeżyć).",
+        "progress_scanning_title": "Skanowanie",
+        "progress_scanning_label_initial": "Skanowanie biblioteki…",
+        "progress_cancel": "Anuluj",
+        "progress_scanning_label": "Skanowanie ({index}/{total}): {name}",
+        "status_scan_cancelled": "Skanowanie przerwane — zapisano {count} utworów przetworzonych do tej pory.",
+        "status_scan_done": "Znaleziono {count} utworów w {path}",
+        "unknown_artist": "Nieznany artysta",
+        "unknown_album": "Nieznany album",
+        "device_none": "— brak —",
+        "msg_no_library_title": "Brak biblioteki",
+        "msg_no_library_text": "Najpierw wybierz i zeskanuj katalog źródłowy.",
+        "sync_whole_library": "całą bibliotekę",
+        "msg_no_device_title": "Brak nośnika",
+        "msg_no_device_text": "Wybierz nośnik docelowy z listy.",
+        "confirm_sync_title": "Potwierdź synchronizację",
+        "confirm_sync_text": "Skopiować {description} na nośnik {mount}?",
+        "progress_sync_title": "Synchronizacja",
+        "progress_sync_label_initial": "Synchronizacja…",
+        "progress_sync_label": "Kopiowanie ({index}/{total}): {name}",
+        "conflict_title": "Konflikt pliku",
+        "conflict_text": "Plik na nośniku różni się od źródłowego:\n{path}\n\nNadpisać?",
+        "sync_done_title": "Synchronizacja zakończona",
+        "sync_result_copied": "Skopiowano",
+        "sync_result_present": "Już obecne",
+        "sync_result_skipped": "Pominięte",
+        "sync_result_errors": "Błędy",
+        "menu_edit_tags": "Edytuj tagi…",
+        "menu_sync_track": "Synchronizuj ten utwór…",
+        "menu_delete_from_device": "Usuń tylko z nośnika",
+        "sync_track_description": "utwór „{title}”",
+        "menu_sync_album": "Synchronizuj album „{album}”…",
+        "menu_sync_artist": "Synchronizuj artystę „{artist}”…",
+        "sync_album_description": "album „{album}”",
+        "sync_artist_description": "artystę „{artist}”",
+        "menu_edit_album_tags": "Edytuj tagi albumu „{album}”…",
+        "confirm_delete_device_title": "Usuń z nośnika",
+        "confirm_delete_device_text": "Usunąć '{title}' tylko z nośnika {mount}?\nPlik źródłowy pozostanie nietknięty.",
+        "field_artist": "Artysta:",
+        "field_album": "Album:",
+        "field_title": "Tytuł:",
+        "field_track": "Nr utworu:",
+        "field_track_total": "Ilość utworów w albumie:",
+        "field_disc": "Nr płyty:",
+        "field_year": "Rok:",
+        "field_genre": "Gatunek:",
+        "field_filename": "Nazwa pliku:",
+        "btn_change_cover": "Zmień okładkę…",
+        "btn_prev": "◀ Poprzedni",
+        "btn_next": "Następny ▶",
+        "btn_save_close": "Zapisz i zamknij",
+        "btn_cancel": "Anuluj",
+        "cover_none": "Brak okładki",
+        "dialog_choose_cover_title": "Wybierz okładkę",
+        "images_filter": "Obrazy (*.jpg *.jpeg *.png)",
+        "error_save_title": "Błąd zapisu",
+        "error_file_exists": "Plik {name} już istnieje",
+        "dialog_title_edit_tags": "Edytuj tagi — {filename}",
+        "dialog_title_edit_album": "Edytuj tagi albumu — {album} ({count} utworów)",
+        "info_apply_to_all": "Zmiany zostaną zastosowane do wszystkich {count} utworów tego albumu.",
+        "btn_change_cover_album": "Zmień okładkę dla całego albumu…",
+        "btn_prev_album": "◀ Poprzedni album",
+        "btn_next_album": "Następny album ▶",
+        "dialog_title_settings": "Ustawienia",
+        "label_dir_template": "Struktura katalogów na nośniku:",
+        "label_filename_template": "Nazwa pliku na nośniku:",
+        "btn_tag_help": "Podpowiedź znaczników…",
+        "tag_help_title": "Dostępne znaczniki",
+        "tag_help_text": (
+            "Dostępne znaczniki (wartości pobierane z tagów audio pliku):\n\n"
+            "{artist}       — wykonawca\n"
+            "{album}        — album\n"
+            "{title}        — tytuł utworu\n"
+            "{track}        — numer utworu, dopełniony do 2 cyfr (1 → 01)\n"
+            "{track_total}  — liczba utworów w albumie, dopełniona do 2 cyfr\n"
+            "{disc}         — numer płyty\n"
+            "{year}         — rok wydania\n"
+            "{genre}        — gatunek\n\n"
+            "Można też dodać własny stały tekst, np.:\n"
+            "muzyka/{artist}\n"
+            "{track}. {artist} - {title}"
+        ),
+        "label_language": "Język:",
+        "label_theme": "Motyw:",
+        "theme_light": "Jasny",
+        "theme_dark": "Ciemny",
+        "theme_auto": "Auto (system)",
+        "btn_save": "Zapisz",
+        "msg_restart_required": "Aby zmiana języka zaczęła obowiązywać, uruchom program ponownie.",
+        "col_artist": "Artysta",
+        "col_album": "Album",
+        "col_disc": "Płyta",
+        "col_title": "Tytuł",
+        "col_track": "Nr",
+        "col_track_total": "Ilość utw.",
+        "col_year": "Rok",
+        "col_genre": "Gatunek",
+        "col_format": "Format",
+        "col_size": "Rozmiar",
+    },
+}
+
+
+def set_language(language: str) -> None:
+    global _current_language
+    if language in TRANSLATIONS:
+        _current_language = language
+
+
+def get_language() -> str:
+    return _current_language
+
+
+def available_languages() -> list[str]:
+    return list(TRANSLATIONS.keys())
+
+
+def tr(key: str, **kwargs) -> str:
+    template = TRANSLATIONS.get(_current_language, {}).get(key)
+    if template is None:
+        template = TRANSLATIONS["en"].get(key, key)
+    if kwargs:
+        return template.format(**kwargs)
+    return template

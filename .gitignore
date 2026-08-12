@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+music_db/
+PROJECT.md
+.claude/
