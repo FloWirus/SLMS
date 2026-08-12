@@ -48,8 +48,7 @@ A portable, self-contained `SLMS-x86_64.AppImage` (no `.venv`/system Python requ
 
 ## Data locations
 
-- Library database: `music_db/library.db` (inside the project directory).
-- App settings (templates, language, theme, last used source directory): `music_db/settings.json`.
+- Library database and app settings (templates, language, theme, last used source directory): `~/.local/share/SLMS/music_db/` (`library.db` and `settings.json`), respecting `$XDG_DATA_HOME` if set. Same location regardless of whether you run from source, `.venv`, or the AppImage — the executable's own location is never used, since an AppImage runs from a fresh temporary mountpoint on every launch.
 - On each synced device: `<device>/music_db/device.db`.
 
 ## Project layout
@@ -125,8 +124,7 @@ Przenośny, samodzielny plik `SLMS-x86_64.AppImage` (nie wymaga `.venv` ani syst
 
 ## Lokalizacja danych
 
-- Baza biblioteki: `music_db/library.db` (w katalogu projektu).
-- Ustawienia aplikacji (szablony, język, motyw, ostatnio używany katalog źródłowy): `music_db/settings.json`.
+- Baza biblioteki i ustawienia aplikacji (szablony, język, motyw, ostatnio używany katalog źródłowy): `~/.local/share/SLMS/music_db/` (`library.db` i `settings.json`), z uwzględnieniem `$XDG_DATA_HOME` jeśli jest ustawione. Ta sama lokalizacja niezależnie od tego, czy uruchamiasz z kodu źródłowego, `.venv`, czy z AppImage — lokalizacja samego pliku wykonywalnego nigdy nie jest używana, bo AppImage przy każdym uruchomieniu montuje się w innym tymczasowym katalogu.
 - Na każdym zsynchronizowanym nośniku: `<nośnik>/music_db/device.db`.
 
 ## Struktura projektu
