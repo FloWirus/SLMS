@@ -1,12 +1,12 @@
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
-    QStyle,
+    QSplitter,
     QTableView,
     QTabWidget,
     QTreeWidget,
@@ -30,9 +30,10 @@ from ..db import MusicDatabase, Track, device_db_path, library_db_path
 from ..i18n import set_language, tr
 from ..scanner import hash_file, scan_directory
 from ..settings import Settings
-from ..sync import ConflictResolution, delete_from_device, sync_to_device
+from ..sync import ConflictResolution, delete_from_device, sync_from_device, sync_to_device
 from .album_edit_dialog import AlbumEditDialog
-from .models import TrackTableModel
+from .icons import full_presence_icon, partial_presence_icon
+from .models import COLUMN_KEYS, TrackTableModel
 from .settings_dialog import SettingsDialog
 from .tag_edit_dialog import TagEditDialog
 from .theme import apply_theme
@@ -50,7 +51,11 @@ class MainWindow(QMainWindow):
         self.source_root: Path | None = None
         self.library_db: MusicDatabase | None = None
         self.selected_device: devicesmod.StorageDevice | None = None
+        self.device_db: MusicDatabase | None = None
         self.device_hashes: set[str] = set()
+        self.source_checked_hashes: set[str] = set()
+        self.device_checked_hashes: set[str] = set()
+        self._updating_checks = False
 
         self.setWindowTitle(APP_NAME)
         self.resize(1000, 650)
@@ -68,75 +73,174 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(self._build_toolbar())
 
-        self.tabs = QTabWidget()
-        self.table_view = self._build_table_view()
-        self.tree_widget = self._build_tree_widget()
-        self.tabs.addTab(self.table_view, tr("tab_table"))
-        self.tabs.addTab(self.tree_widget, tr("tab_tree"))
-        layout.addWidget(self.tabs)
+        splitter = QSplitter(Qt.Horizontal)
+
+        self.table_view = self._build_table_view(
+            tr("col_on_device"), self.source_checked_hashes, self._on_source_table_check_changed
+        )
+        self.table_model = self.table_view.model().sourceModel()
+        self.proxy_model = self.table_view.model()
+        self.tree_widget = self._build_tree_widget(self._tree_context_menu, self._edit_tree_item)
+        source_pane = self._build_pane(
+            tr("pane_source_title"), self.table_view, self.tree_widget, self._sync_checked_tree
+        )
+        splitter.addWidget(source_pane)
+
+        self.device_table_view = self._build_table_view(
+            tr("col_on_pc"), self.device_checked_hashes, self._on_device_table_check_changed
+        )
+        self.device_table_view.customContextMenuRequested.disconnect()
+        self.device_table_view.doubleClicked.disconnect()
+        self.device_table_view.customContextMenuRequested.connect(self._device_table_context_menu)
+        self.device_table_model = self.device_table_view.model().sourceModel()
+        self.device_proxy_model = self.device_table_view.model()
+        self.device_tree_widget = self._build_tree_widget(self._device_tree_context_menu, None)
+        device_pane = self._build_pane(
+            tr("pane_device_title"), self.device_table_view, self.device_tree_widget, self._sync_checked_device_tree
+        )
+        splitter.addWidget(device_pane)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
 
         self.status_label = QLabel(tr("status_choose_directory"))
-        layout.addWidget(self.status_label)
+        layout.addWidget(self.status_label, 0)
 
-    def _build_toolbar(self) -> QHBoxLayout:
-        row = QHBoxLayout()
+    def _build_toolbar(self) -> QGridLayout:
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
 
+        left = QWidget()
+        left_layout = QHBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         choose_dir_btn = QPushButton(tr("btn_choose_dir"))
         choose_dir_btn.clicked.connect(self._choose_source_directory)
-        row.addWidget(choose_dir_btn)
+        left_layout.addWidget(choose_dir_btn)
 
         rescan_btn = QPushButton(tr("btn_rescan"))
         rescan_btn.clicked.connect(self._rescan_source)
-        row.addWidget(rescan_btn)
+        left_layout.addWidget(rescan_btn)
+        left_layout.addStretch()
 
-        row.addSpacing(20)
-        row.addWidget(QLabel(tr("label_target_device")))
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        sync_btn = QPushButton(tr("btn_sync"))
+        sync_btn.clicked.connect(self._run_sync)
+        center_layout.addWidget(sync_btn)
+
+        sync_from_device_btn = QPushButton(tr("btn_sync_from_device"))
+        sync_from_device_btn.clicked.connect(self._run_reverse_sync)
+        center_layout.addWidget(sync_from_device_btn)
+
+        right = QWidget()
+        right_layout = QHBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addStretch()
+        right_layout.addWidget(QLabel(tr("label_target_device")))
 
         self.device_combo = QComboBox()
-        self.device_combo.setMinimumWidth(280)
+        self.device_combo.setMinimumWidth(220)
         self.device_combo.currentIndexChanged.connect(self._on_device_selected)
-        row.addWidget(self.device_combo)
+        right_layout.addWidget(self.device_combo)
 
         refresh_devices_btn = QPushButton(tr("btn_refresh_devices"))
         refresh_devices_btn.clicked.connect(self._refresh_devices)
-        row.addWidget(refresh_devices_btn)
+        right_layout.addWidget(refresh_devices_btn)
 
-        sync_btn = QPushButton(tr("btn_sync"))
-        sync_btn.clicked.connect(self._run_sync)
-        row.addWidget(sync_btn)
+        rescan_device_btn = QPushButton(tr("btn_rescan_device"))
+        rescan_device_btn.clicked.connect(self._rescan_device)
+        right_layout.addWidget(rescan_device_btn)
 
         eject_btn = QPushButton(tr("btn_eject"))
         eject_btn.clicked.connect(self._eject_device)
-        row.addWidget(eject_btn)
+        right_layout.addWidget(eject_btn)
 
-        row.addStretch()
-
+        right_layout.addSpacing(20)
         settings_btn = QPushButton(tr("btn_settings"))
         settings_btn.clicked.connect(self._open_settings)
-        row.addWidget(settings_btn)
+        right_layout.addWidget(settings_btn)
 
-        return row
+        grid.addWidget(left, 0, 0)
+        grid.addWidget(center, 0, 1, Qt.AlignHCenter)
+        grid.addWidget(right, 0, 2)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 0)
+        grid.setColumnStretch(2, 1)
 
-    def _build_table_view(self) -> QTableView:
+        # Force the outer columns to the same minimum width so the center
+        # column (sync buttons) sits exactly in the middle regardless of how
+        # much content the left/right sides hold.
+        equal_width = max(left.sizeHint().width(), right.sizeHint().width())
+        grid.setColumnMinimumWidth(0, equal_width)
+        grid.setColumnMinimumWidth(2, equal_width)
+
+        return grid
+
+    def _build_pane(self, title: str, table_view: QTableView, tree_widget: QTreeWidget, sync_checked_handler) -> QWidget:
+        pane = QWidget()
+        pane_layout = QVBoxLayout(pane)
+        pane_layout.setContentsMargins(0, 0, 0, 0)
+        pane_layout.addWidget(QLabel(f"<b>{title}</b>"), 0)
+
+        tabs = QTabWidget()
+        tabs.addTab(table_view, tr("tab_table"))
+        tabs.addTab(tree_widget, tr("tab_tree"))
+        pane_layout.addWidget(tabs, 1)
+
+        sync_checked_btn = QPushButton(tr("btn_sync_checked"))
+        sync_checked_btn.clicked.connect(sync_checked_handler)
+        pane_layout.addWidget(sync_checked_btn, 0, Qt.AlignRight)
+        return pane
+
+    def _build_table_view(self, presence_label: str, checked_hashes: set[str], on_check_changed) -> QTableView:
         view = QTableView()
-        self.table_model = TrackTableModel()
-        self.proxy_model = QSortFilterProxyModel()
-        self.proxy_model.setSourceModel(self.table_model)
-        view.setModel(self.proxy_model)
+        model = TrackTableModel(presence_label=presence_label, checked_hashes=checked_hashes, on_check_changed=on_check_changed)
+        proxy_model = QSortFilterProxyModel()
+        proxy_model.setSourceModel(model)
+        view.setModel(proxy_model)
         view.setSortingEnabled(True)
+        view.setColumnWidth(0, 28)
         view.setSelectionBehavior(QAbstractItemView.SelectRows)
         view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         view.setContextMenuPolicy(Qt.CustomContextMenu)
         view.customContextMenuRequested.connect(self._table_context_menu)
         view.doubleClicked.connect(self._edit_selected_table_track)
+        view.clicked.connect(self._on_table_clicked)
+        header = view.horizontalHeader()
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(lambda pos, v=view: self._show_column_menu(v, pos))
         return view
 
-    def _build_tree_widget(self) -> QTreeWidget:
+    def _on_table_clicked(self, index):
+        key = COLUMN_KEYS[index.column()][0]
+        if key != "checked":
+            return
+        proxy = index.model()
+        source_index = proxy.mapToSource(index)
+        source_index.model().toggle_checked(source_index.row())
+
+    def _show_column_menu(self, view: QTableView, pos):
+        header = view.horizontalHeader()
+        model = view.model()
+        menu = QMenu(self)
+        for column in range(len(COLUMN_KEYS)):
+            label = model.headerData(column, Qt.Horizontal, Qt.DisplayRole)
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not view.isColumnHidden(column))
+            action.toggled.connect(lambda checked, c=column, v=view: v.setColumnHidden(c, not checked))
+        menu.exec(header.mapToGlobal(pos))
+
+    def _build_tree_widget(self, context_menu_handler, double_click_handler) -> QTreeWidget:
         tree = QTreeWidget()
         tree.setHeaderLabels([tr("tree_header_name"), tr("tree_header_year"), tr("tree_header_format")])
         tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        tree.customContextMenuRequested.connect(self._tree_context_menu)
-        tree.itemDoubleClicked.connect(self._edit_tree_item)
+        tree.customContextMenuRequested.connect(context_menu_handler)
+        if double_click_handler:
+            tree.itemDoubleClicked.connect(double_click_handler)
+        tree.itemChanged.connect(self._on_tree_item_changed)
         return tree
 
     # ---------- source directory / scanning ----------
@@ -197,45 +301,218 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText(tr("status_scan_done", count=len(tracks), path=self.source_root))
 
+    def _rescan_device(self):
+        if not self.selected_device or not self.device_db:
+            QMessageBox.information(self, tr("msg_no_device_title"), tr("msg_no_device_text"))
+            return
+
+        progress = QProgressDialog(tr("progress_scanning_label_initial"), tr("progress_cancel"), 0, 0, self)
+        progress.setWindowTitle(f"{APP_NAME} — {tr('progress_scanning_title')}")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def on_progress(index: int, total: int, path: Path):
+            if total:
+                progress.setMaximum(total)
+                progress.setValue(index)
+            progress.setLabelText(tr("progress_scanning_label", index=index, total=total, name=path.name))
+            QApplication.processEvents()
+
+        tracks = scan_directory(
+            Path(self.selected_device.mountpoint),
+            self.device_db,
+            progress_callback=on_progress,
+            should_stop=progress.wasCanceled,
+        )
+        cancelled = progress.wasCanceled()
+        progress.close()
+
+        self.device_hashes = self.device_db.hashes()
+        self._refresh_views()
+        if cancelled:
+            self.status_label.setText(tr("status_scan_cancelled", count=len(tracks)))
+        else:
+            self.status_label.setText(tr("status_scan_done", count=len(tracks), path=self.selected_device.mountpoint))
+
     def _refresh_views(self):
+        self._refresh_source_views()
+        self._refresh_device_views()
+
+    def _refresh_source_views(self):
         if not self.library_db:
             return
         tracks = self.library_db.all_tracks()
         self.table_model.set_tracks(tracks)
         self.table_model.set_device_hashes(self.device_hashes)
-        self._populate_tree(tracks)
+        self._populate_tree(self.tree_widget, tracks, self.device_hashes, self.source_checked_hashes)
 
-    def _populate_tree(self, tracks: list[Track]):
-        self.tree_widget.clear()
-        by_artist: dict[str, dict[str, list[Track]]] = {}
-        for track in tracks:
-            artist = track.artist or tr("unknown_artist")
-            album = track.album or tr("unknown_album")
-            by_artist.setdefault(artist, {}).setdefault(album, []).append(track)
+    def _refresh_device_views(self):
+        tracks = self.device_db.all_tracks() if self.device_db else []
+        library_hashes = self.library_db.hashes() if self.library_db else set()
+        self.device_table_model.set_tracks(tracks)
+        self.device_table_model.set_device_hashes(library_hashes)
+        self._populate_tree(self.device_tree_widget, tracks, library_hashes, self.device_checked_hashes)
 
-        on_device_icon = self._on_device_icon()
+    def _populate_tree(
+        self, tree_widget: QTreeWidget, tracks: list[Track], other_hashes: set[str], checked_hashes: set[str]
+    ):
+        self._updating_checks = True
+        try:
+            tree_widget.clear()
+            by_artist: dict[str, dict[str, list[Track]]] = {}
+            for track in tracks:
+                artist = track.artist or tr("unknown_artist")
+                album = track.album or tr("unknown_album")
+                by_artist.setdefault(artist, {}).setdefault(album, []).append(track)
 
-        for artist in sorted(by_artist):
-            artist_item = QTreeWidgetItem([artist])
-            artist_item.setData(0, Qt.UserRole, {"type": "artist", "artist": artist})
-            for album in sorted(by_artist[artist]):
-                album_item = QTreeWidgetItem([album])
-                album_item.setData(0, Qt.UserRole, {"type": "album", "artist": artist, "album": album})
-                for track in by_artist[artist][album]:
-                    label = f"{track.track_number}. {track.title}" if track.track_number else track.title
-                    track_item = QTreeWidgetItem([label, track.year, track.format])
-                    track_item.setData(0, Qt.UserRole, {"type": "track", "track": track})
-                    if track.hash in self.device_hashes:
-                        track_item.setIcon(0, on_device_icon)
-                    album_item.addChild(track_item)
-                artist_item.addChild(album_item)
-            self.tree_widget.addTopLevelItem(artist_item)
+            for artist in sorted(by_artist):
+                artist_item = QTreeWidgetItem([artist])
+                artist_item.setData(0, Qt.UserRole, {"type": "artist", "artist": artist})
+                artist_item.setFlags(artist_item.flags() | Qt.ItemIsUserCheckable)
+                artist_present_flags = []
+                artist_checked_flags = []
+                for album in sorted(by_artist[artist]):
+                    album_item = QTreeWidgetItem([album])
+                    album_item.setData(0, Qt.UserRole, {"type": "album", "artist": artist, "album": album})
+                    album_item.setFlags(album_item.flags() | Qt.ItemIsUserCheckable)
+                    album_present_flags = []
+                    album_checked_flags = []
+                    for track in by_artist[artist][album]:
+                        label = f"{track.track_number}. {track.title}" if track.track_number else track.title
+                        track_item = QTreeWidgetItem([label, track.year, track.format])
+                        track_item.setData(0, Qt.UserRole, {"type": "track", "track": track})
+                        track_item.setFlags(track_item.flags() | Qt.ItemIsUserCheckable)
+                        checked = track.hash in checked_hashes
+                        track_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+                        present = track.hash in other_hashes
+                        if present:
+                            track_item.setIcon(0, full_presence_icon())
+                        album_present_flags.append(present)
+                        album_checked_flags.append(checked)
+                        album_item.addChild(track_item)
+                    album_item.setCheckState(0, self._aggregate_check_state(album_checked_flags))
+                    self._set_presence_icon(album_item, album_present_flags)
+                    artist_present_flags.extend(album_present_flags)
+                    artist_checked_flags.extend(album_checked_flags)
+                    artist_item.addChild(album_item)
+                artist_item.setCheckState(0, self._aggregate_check_state(artist_checked_flags))
+                self._set_presence_icon(artist_item, artist_present_flags)
+                tree_widget.addTopLevelItem(artist_item)
 
-        self.tree_widget.expandToDepth(0)
+            tree_widget.expandToDepth(0)
+        finally:
+            self._updating_checks = False
 
-    def _on_device_icon(self) -> QIcon:
-        style = QApplication.instance().style()
-        return style.standardIcon(QStyle.SP_DialogApplyButton)
+    def _aggregate_check_state(self, flags: list[bool]) -> Qt.CheckState:
+        if flags and all(flags):
+            return Qt.Checked
+        if any(flags):
+            return Qt.PartiallyChecked
+        return Qt.Unchecked
+
+    def _set_presence_icon(self, item: QTreeWidgetItem, present_flags: list[bool]):
+        if present_flags and all(present_flags):
+            item.setIcon(0, full_presence_icon())
+        elif any(present_flags):
+            item.setIcon(0, partial_presence_icon())
+
+    def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int):
+        if column != 0 or self._updating_checks:
+            return
+        self._updating_checks = True
+        try:
+            state = item.checkState(0)
+            if state != Qt.PartiallyChecked:
+                self._set_children_check_state(item, state)
+            self._update_parent_check_state(item.parent())
+            self._sync_hash_set_from_tree_item(item)
+        finally:
+            self._updating_checks = False
+
+    def _set_children_check_state(self, item: QTreeWidgetItem, state: Qt.CheckState):
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(0, state)
+            self._set_children_check_state(child, state)
+
+    def _update_parent_check_state(self, parent: QTreeWidgetItem | None):
+        if parent is None:
+            return
+        states = {parent.child(i).checkState(0) for i in range(parent.childCount())}
+        parent.setCheckState(0, states.pop() if len(states) == 1 else Qt.PartiallyChecked)
+        self._update_parent_check_state(parent.parent())
+
+    def _checked_state_for_tree(self, tree_widget: QTreeWidget):
+        if tree_widget is self.tree_widget:
+            return self.source_checked_hashes, self.table_model
+        return self.device_checked_hashes, self.device_table_model
+
+    def _sync_hash_set_from_tree_item(self, item: QTreeWidgetItem):
+        checked_hashes, table_model = self._checked_state_for_tree(item.treeWidget())
+        changed = False
+
+        def walk(node: QTreeWidgetItem):
+            nonlocal changed
+            data = node.data(0, Qt.UserRole) or {}
+            if data.get("type") == "track":
+                track_hash = data["track"].hash
+                is_checked = node.checkState(0) == Qt.Checked
+                if is_checked and track_hash not in checked_hashes:
+                    checked_hashes.add(track_hash)
+                    changed = True
+                elif not is_checked and track_hash in checked_hashes:
+                    checked_hashes.discard(track_hash)
+                    changed = True
+            for i in range(node.childCount()):
+                walk(node.child(i))
+
+        walk(item)
+        if changed:
+            table_model.refresh_checked()
+
+    def _sync_check_state_to_tree(self, tree_widget: QTreeWidget, track_hash: str, checked: bool):
+        self._updating_checks = True
+        try:
+            def walk(item: QTreeWidgetItem) -> bool:
+                data = item.data(0, Qt.UserRole) or {}
+                if data.get("type") == "track" and data["track"].hash == track_hash:
+                    item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+                    self._update_parent_check_state(item.parent())
+                    return True
+                for i in range(item.childCount()):
+                    if walk(item.child(i)):
+                        return True
+                return False
+
+            for i in range(tree_widget.topLevelItemCount()):
+                if walk(tree_widget.topLevelItem(i)):
+                    break
+        finally:
+            self._updating_checks = False
+
+    def _on_source_table_check_changed(self, track_hash: str, checked: bool):
+        self._sync_check_state_to_tree(self.tree_widget, track_hash, checked)
+
+    def _on_device_table_check_changed(self, track_hash: str, checked: bool):
+        self._sync_check_state_to_tree(self.device_tree_widget, track_hash, checked)
+
+    def _sync_checked_tree(self):
+        if not self.library_db:
+            return
+        tracks = [t for t in self.library_db.all_tracks() if t.hash in self.source_checked_hashes]
+        if not tracks:
+            QMessageBox.information(self, tr("msg_no_checked_title"), tr("msg_no_checked_text"))
+            return
+        self._sync_tracks(tracks, tr("sync_checked_description", count=len(tracks)))
+
+    def _sync_checked_device_tree(self):
+        if not self.device_db:
+            return
+        tracks = [t for t in self.device_db.all_tracks() if t.hash in self.device_checked_hashes]
+        if not tracks:
+            QMessageBox.information(self, tr("msg_no_checked_title"), tr("msg_no_checked_text"))
+            return
+        self._sync_tracks_from_device(tracks, tr("sync_checked_description", count=len(tracks)))
 
     # ---------- devices ----------
 
@@ -259,10 +536,12 @@ class MainWindow(QMainWindow):
 
     def _on_device_selected(self, index: int):
         self.selected_device = self.device_combo.itemData(index)
+        if self.device_db:
+            self.device_db.close()
+            self.device_db = None
         if self.selected_device:
-            device_db = MusicDatabase(device_db_path(Path(self.selected_device.mountpoint)))
-            self.device_hashes = device_db.hashes()
-            device_db.close()
+            self.device_db = MusicDatabase(device_db_path(Path(self.selected_device.mountpoint)))
+            self.device_hashes = self.device_db.hashes()
         else:
             self.device_hashes = set()
         self._refresh_views()
@@ -273,6 +552,9 @@ class MainWindow(QMainWindow):
             return
 
         device = self.selected_device
+        if self.device_db:
+            self.device_db.close()
+            self.device_db = None
         success, error = devicesmod.eject_device(device)
         if success:
             QMessageBox.information(self, tr("msg_eject_success_title"), tr("msg_eject_success_text"))
@@ -287,6 +569,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("msg_no_library_title"), tr("msg_no_library_text"))
             return
         self._sync_tracks(self.library_db.all_tracks(), tr("sync_whole_library"))
+
+    def _run_reverse_sync(self):
+        if not self.selected_device or not self.device_db:
+            QMessageBox.information(self, tr("msg_no_device_title"), tr("msg_no_device_text"))
+            return
+        self._sync_tracks_from_device(self.device_db.all_tracks(), tr("sync_whole_device"))
 
     def _tracks_for_artist(self, artist: str) -> list[Track]:
         return [t for t in self.library_db.all_tracks() if (t.artist or tr("unknown_artist")) == artist]
@@ -359,6 +647,68 @@ class MainWindow(QMainWindow):
             message += "\n\n" + "\n".join(result.errors[:10])
         QMessageBox.information(self, tr("sync_done_title"), message)
 
+    def _sync_tracks_from_device(self, tracks: list[Track], description: str):
+        if not self.source_root or not self.library_db:
+            QMessageBox.information(self, tr("msg_no_library_title"), tr("msg_no_library_text"))
+            return
+        if not self.selected_device or not self.device_db:
+            QMessageBox.information(self, tr("msg_no_device_title"), tr("msg_no_device_text"))
+            return
+        if not tracks:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            tr("confirm_sync_title"),
+            tr("confirm_sync_from_device_text", description=description, mount=self.selected_device.mountpoint),
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        progress = QProgressDialog(tr("progress_sync_label_initial"), tr("progress_cancel"), 0, len(tracks), self)
+        progress.setWindowTitle(f"{APP_NAME} — {tr('progress_sync_title')}")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def on_progress(index, total, track: Track):
+            progress.setMaximum(total)
+            progress.setValue(index)
+            progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
+            QApplication.processEvents()
+
+        def on_conflict(track: Track, target_path: Path) -> ConflictResolution:
+            reply = QMessageBox.question(
+                self,
+                tr("conflict_title"),
+                tr("conflict_text", path=target_path),
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            return ConflictResolution.OVERWRITE if reply == QMessageBox.Yes else ConflictResolution.SKIP
+
+        result = sync_from_device(
+            Path(self.selected_device.mountpoint),
+            tracks,
+            self.source_root,
+            self.library_db,
+            self.settings.dir_template,
+            self.settings.filename_template,
+            on_conflict=on_conflict,
+            on_progress=on_progress,
+        )
+        progress.close()
+
+        self._refresh_views()
+
+        message = (
+            f"{tr('sync_result_copied')}: {result.copied}\n"
+            f"{tr('sync_result_present')}: {result.already_present}\n"
+            f"{tr('sync_result_skipped')}: {result.skipped}\n"
+            f"{tr('sync_result_errors')}: {len(result.errors)}"
+        )
+        if result.errors:
+            message += "\n\n" + "\n".join(result.errors[:10])
+        QMessageBox.information(self, tr("sync_done_title"), message)
+
     # ---------- tag editing ----------
 
     def _table_ordered_tracks(self) -> list[Track]:
@@ -395,7 +745,9 @@ class MainWindow(QMainWindow):
     def _edit_track_sequence(self, tracks: list[Track], start_index: int):
         if not self.source_root or not self.library_db or not tracks:
             return
-        dialog = TagEditDialog(self.source_root, tracks, start_index, on_saved=self._persist_track_edit, parent=self)
+        dialog = TagEditDialog(
+            self.source_root, tracks, start_index, on_saved=self._persist_track_edit, settings=self.settings, parent=self
+        )
         dialog.exec()
         self._refresh_views()
 
@@ -458,6 +810,46 @@ class MainWindow(QMainWindow):
                 description=tr("sync_artist_description", artist=data["artist"]),
             )
 
+    def _device_table_context_menu(self, pos):
+        index = self.device_table_view.indexAt(pos)
+        if not index.isValid():
+            return
+        source_row = self.device_proxy_model.mapToSource(self.device_proxy_model.index(index.row(), 0)).row()
+        track = self.device_table_model.track_at(source_row)
+        self._show_device_track_menu(track, self.device_table_view.viewport().mapToGlobal(pos))
+
+    def _device_tree_context_menu(self, pos):
+        item = self.device_tree_widget.itemAt(pos)
+        if not item:
+            return
+        data = item.data(0, Qt.UserRole) or {}
+        if data.get("type") == "track":
+            self._show_device_track_menu(data["track"], self.device_tree_widget.viewport().mapToGlobal(pos))
+
+    def _show_device_track_menu(self, device_track: Track, global_pos):
+        menu = QMenu(self)
+        delete_action = menu.addAction(tr("menu_delete_from_device"))
+        action = menu.exec(global_pos)
+        if action == delete_action:
+            self._delete_device_track(device_track)
+
+    def _delete_device_track(self, device_track: Track):
+        if not self.selected_device:
+            return
+        reply = QMessageBox.question(
+            self,
+            tr("confirm_delete_device_title"),
+            tr("confirm_delete_device_text", title=device_track.title, mount=self.selected_device.mountpoint),
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if self.device_db:
+            self.device_db.close()
+            self.device_db = None
+        delete_from_device(Path(self.selected_device.mountpoint), device_track)
+        self._on_device_selected(self.device_combo.currentIndex())
+
     def _show_track_menu(self, track: Track, tracks: list[Track], index: int, global_pos):
         menu = QMenu(self)
         edit_action = menu.addAction(tr("menu_edit_tags"))
@@ -518,29 +910,19 @@ class MainWindow(QMainWindow):
             if (first.artist or tr("unknown_artist")) == artist and (first.album or tr("unknown_album")) == album:
                 start_index = idx
                 break
-        dialog = AlbumEditDialog(self.source_root, albums, start_index, on_saved=self._persist_track_edit, parent=self)
+        dialog = AlbumEditDialog(
+            self.source_root, albums, start_index, on_saved=self._persist_track_edit, settings=self.settings, parent=self
+        )
         dialog.exec()
         self._refresh_views()
 
     def _delete_from_device(self, track: Track):
-        if not self.selected_device:
+        if not self.selected_device or not self.device_db:
             return
-        device_db = MusicDatabase(device_db_path(Path(self.selected_device.mountpoint)))
-        device_track = device_db.get_by_hash(track.hash)
-        device_db.close()
+        device_track = self.device_db.get_by_hash(track.hash)
         if not device_track:
             return
-
-        reply = QMessageBox.question(
-            self,
-            tr("confirm_delete_device_title"),
-            tr("confirm_delete_device_text", title=track.title, mount=self.selected_device.mountpoint),
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        delete_from_device(Path(self.selected_device.mountpoint), device_track)
-        self._on_device_selected(self.device_combo.currentIndex())
+        self._delete_device_track(device_track)
 
     # ---------- settings ----------
 

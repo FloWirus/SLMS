@@ -12,6 +12,8 @@ class Settings:
     last_source_root: str = ""
     language: str = "en"
     theme: str = "auto"
+    cover_max_size: int = 500
+    cover_dpi: int = 72
 
     @staticmethod
     def load(project_root: Path) -> "Settings":

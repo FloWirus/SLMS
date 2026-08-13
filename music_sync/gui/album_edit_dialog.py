@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
 from .. import tags as tagsmod
 from ..db import Track
 from ..i18n import tr
+from ..settings import Settings
+from .cover_utils import resize_cover_bytes
 
 COVER_SIZE = 150
 DIALOG_MIN_SIZE = (650, 480)
@@ -38,6 +40,7 @@ class AlbumEditDialog(QDialog):
         albums: list[list[Track]],
         start_index: int,
         on_saved: OnSavedCallback,
+        settings: Settings,
         parent=None,
     ):
         super().__init__(parent)
@@ -45,6 +48,7 @@ class AlbumEditDialog(QDialog):
         self.albums = [list(tracks) for tracks in albums]
         self.index = start_index
         self.on_saved = on_saved
+        self.settings = settings
         self._new_cover_bytes: bytes | None = None
         self._new_cover_mime = "image/jpeg"
 
@@ -61,11 +65,18 @@ class AlbumEditDialog(QDialog):
 
         top_row = QHBoxLayout()
 
+        cover_box = QVBoxLayout()
         self.cover_label = QLabel()
         self.cover_label.setFixedSize(COVER_SIZE, COVER_SIZE)
         self.cover_label.setStyleSheet("border: 1px solid gray;")
         self.cover_label.setAlignment(Qt.AlignCenter)
-        top_row.addWidget(self.cover_label)
+        cover_box.addWidget(self.cover_label)
+
+        self.cover_size_label = QLabel()
+        self.cover_size_label.setAlignment(Qt.AlignCenter)
+        cover_box.addWidget(self.cover_size_label)
+        cover_box.addStretch(1)
+        top_row.addLayout(cover_box)
 
         form_layout = QFormLayout()
         self.artist_edit = QLineEdit()
@@ -141,9 +152,11 @@ class AlbumEditDialog(QDialog):
             self.cover_label.setPixmap(
                 pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
+            self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
         else:
             self.cover_label.clear()
             self.cover_label.setText(tr("cover_none"))
+            self.cover_size_label.clear()
 
     def _choose_cover(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -152,12 +165,18 @@ class AlbumEditDialog(QDialog):
         if not path:
             return
         image_path = Path(path)
-        self._new_cover_bytes = image_path.read_bytes()
-        self._new_cover_mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
-        pixmap = QPixmap(path)
+        mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+        resized_bytes = resize_cover_bytes(
+            image_path.read_bytes(), mime, self.settings.cover_max_size, self.settings.cover_dpi
+        )
+        self._new_cover_bytes = resized_bytes
+        self._new_cover_mime = mime
+        pixmap = QPixmap()
+        pixmap.loadFromData(resized_bytes)
         self.cover_label.setPixmap(
             pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )
+        self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
 
     def _save_current(self) -> bool:
         artist = self.artist_edit.text()

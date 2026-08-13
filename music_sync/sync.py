@@ -39,30 +39,63 @@ def sync_to_device(
     on_conflict: ConflictCallback,
     on_progress: ProgressCallback | None = None,
 ) -> SyncResult:
-    source_root = Path(source_root)
     device_mountpoint = Path(device_mountpoint)
     device_db = MusicDatabase(device_db_path(device_mountpoint))
+    result = _copy_tracks(
+        source_root, tracks, device_mountpoint, device_db, dir_template, filename_template, on_conflict, on_progress
+    )
+    device_db.close()
+    return result
+
+
+def sync_from_device(
+    device_mountpoint: Path,
+    tracks: list[Track],
+    target_root: Path,
+    target_db: MusicDatabase,
+    dir_template: str,
+    filename_template: str,
+    on_conflict: ConflictCallback,
+    on_progress: ProgressCallback | None = None,
+) -> SyncResult:
+    return _copy_tracks(
+        device_mountpoint, tracks, target_root, target_db, dir_template, filename_template, on_conflict, on_progress
+    )
+
+
+def _copy_tracks(
+    source_root: Path,
+    tracks: list[Track],
+    target_root: Path,
+    target_db: MusicDatabase,
+    dir_template: str,
+    filename_template: str,
+    on_conflict: ConflictCallback,
+    on_progress: ProgressCallback | None = None,
+) -> SyncResult:
+    source_root = Path(source_root)
+    target_root = Path(target_root)
     result = SyncResult()
 
-    device_hashes = device_db.hashes()
+    target_hashes = target_db.hashes()
 
     total = len(tracks)
     for index, track in enumerate(tracks, start=1):
         if on_progress:
             on_progress(index, total, track)
 
-        if track.hash in device_hashes:
+        if track.hash in target_hashes:
             result.already_present += 1
             continue
 
         rel_target = build_relative_target_path(dir_template, filename_template, track)
-        target_path = device_mountpoint / rel_target
+        target_path = target_root / rel_target
 
         if target_path.exists():
             existing_hash = hash_file(target_path)
             if existing_hash == track.hash:
-                _register_on_device(device_db, track, rel_target, existing_hash)
-                device_hashes.add(track.hash)
+                _register_track(target_db, track, rel_target, existing_hash)
+                target_hashes.add(track.hash)
                 result.already_present += 1
                 continue
             resolution = on_conflict(track, target_path)
@@ -74,18 +107,17 @@ def sync_to_device(
             source_path = source_root / track.path
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, target_path)
-            _register_on_device(device_db, track, rel_target, track.hash)
-            device_hashes.add(track.hash)
+            _register_track(target_db, track, rel_target, track.hash)
+            target_hashes.add(track.hash)
             result.copied += 1
         except OSError as exc:
             result.errors.append(f"{track.path}: {exc}")
 
-    device_db.close()
     return result
 
 
-def _register_on_device(device_db: MusicDatabase, track: Track, rel_target: str, file_hash: str) -> None:
-    device_track = Track(
+def _register_track(target_db: MusicDatabase, track: Track, rel_target: str, file_hash: str) -> None:
+    registered_track = Track(
         id=None,
         path=rel_target,
         filename=Path(rel_target).name,
@@ -100,7 +132,7 @@ def _register_on_device(device_db: MusicDatabase, track: Track, rel_target: str,
         size=track.size,
         mtime=track.mtime,
     )
-    device_db.upsert_track(device_track)
+    target_db.upsert_track(registered_track)
 
 
 def delete_from_device(device_mountpoint: Path, device_track: Track) -> None:

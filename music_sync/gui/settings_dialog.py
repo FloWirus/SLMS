@@ -1,3 +1,4 @@
+from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -30,6 +31,14 @@ class SettingsDialog(QDialog):
         self.filename_template_edit = QLineEdit(self._settings.filename_template)
         form.addRow(tr("label_dir_template"), self.dir_template_edit)
         form.addRow(tr("label_filename_template"), self.filename_template_edit)
+
+        self.cover_size_edit = QLineEdit(str(self._settings.cover_max_size))
+        self.cover_size_edit.setValidator(QIntValidator(1, 10000, self))
+        form.addRow(tr("label_cover_size"), self.cover_size_edit)
+
+        self.cover_dpi_edit = QLineEdit(str(self._settings.cover_dpi))
+        self.cover_dpi_edit.setValidator(QIntValidator(1, 2400, self))
+        form.addRow(tr("label_cover_dpi"), self.cover_dpi_edit)
 
         self.language_combo = QComboBox()
         for code in available_languages():
@@ -78,6 +87,8 @@ class SettingsDialog(QDialog):
             last_source_root=self._settings.last_source_root,
             language=self.language_combo.currentData(),
             theme=self.theme_combo.currentData(),
+            cover_max_size=int(self.cover_size_edit.text() or self._settings.cover_max_size),
+            cover_dpi=int(self.cover_dpi_edit.text() or self._settings.cover_dpi),
         )
 
 

@@ -1,11 +1,11 @@
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QStyle, QApplication
 
 from ..db import Track
 from ..i18n import tr
+from .icons import checkbox_icon, full_presence_icon
 
 COLUMN_KEYS = [
+    ("checked", None),
     ("on_device", None),
     ("artist", "col_artist"),
     ("album", "col_album"),
@@ -20,8 +20,18 @@ COLUMN_KEYS = [
 ]
 
 
-def _columns():
-    return [(field, tr(label_key) if label_key else "") for field, label_key in COLUMN_KEYS]
+def _columns(presence_label: str = ""):
+    headers = []
+    for field, label_key in COLUMN_KEYS:
+        if field == "checked":
+            headers.append((field, "✓"))
+        elif field == "on_device":
+            headers.append((field, presence_label))
+        elif label_key:
+            headers.append((field, tr(label_key)))
+        else:
+            headers.append((field, ""))
+    return headers
 
 
 def format_size(num_bytes: int) -> str:
@@ -34,10 +44,20 @@ def format_size(num_bytes: int) -> str:
 
 
 class TrackTableModel(QAbstractTableModel):
-    def __init__(self, tracks: list[Track] | None = None, device_hashes: set[str] | None = None):
+    def __init__(
+        self,
+        tracks: list[Track] | None = None,
+        device_hashes: set[str] | None = None,
+        presence_label: str = "",
+        checked_hashes: set[str] | None = None,
+        on_check_changed=None,
+    ):
         super().__init__()
         self._tracks: list[Track] = tracks or []
         self._device_hashes: set[str] = device_hashes or set()
+        self._presence_label = presence_label
+        self._checked_hashes: set[str] = checked_hashes if checked_hashes is not None else set()
+        self._on_check_changed = on_check_changed
 
     def set_tracks(self, tracks: list[Track]) -> None:
         self.beginResetModel()
@@ -54,6 +74,27 @@ class TrackTableModel(QAbstractTableModel):
     def track_at(self, row: int) -> Track:
         return self._tracks[row]
 
+    def checked_tracks(self) -> list[Track]:
+        return [t for t in self._tracks if t.hash in self._checked_hashes]
+
+    def refresh_checked(self) -> None:
+        if self._tracks:
+            top_left = self.index(0, 0)
+            bottom_right = self.index(len(self._tracks) - 1, 0)
+            self.dataChanged.emit(top_left, bottom_right, [Qt.DecorationRole])
+
+    def toggle_checked(self, row: int) -> None:
+        track = self._tracks[row]
+        checked = track.hash not in self._checked_hashes
+        if checked:
+            self._checked_hashes.add(track.hash)
+        else:
+            self._checked_hashes.discard(track.hash)
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [Qt.DecorationRole])
+        if self._on_check_changed:
+            self._on_check_changed(track.hash, checked)
+
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._tracks)
 
@@ -62,7 +103,7 @@ class TrackTableModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role == Qt.DisplayRole and orientation == Qt.Horizontal:
-            return _columns()[section][1]
+            return _columns(self._presence_label)[section][1]
         return None
 
     def data(self, index: QModelIndex, role=Qt.DisplayRole):
@@ -71,10 +112,14 @@ class TrackTableModel(QAbstractTableModel):
         track = self._tracks[index.row()]
         key, _ = COLUMN_KEYS[index.column()]
 
+        if key == "checked":
+            if role == Qt.DecorationRole:
+                return checkbox_icon(track.hash in self._checked_hashes)
+            return None
+
         if key == "on_device":
             if role == Qt.DecorationRole and track.hash in self._device_hashes:
-                style = QApplication.instance().style()
-                return style.standardIcon(QStyle.SP_DialogApplyButton)
+                return full_presence_icon()
             return None
 
         if role == Qt.DisplayRole:
@@ -93,6 +138,10 @@ class TrackTableModel(QAbstractTableModel):
         self.layoutAboutToBeChanged.emit()
 
         def sort_key(track: Track):
+            if key == "checked":
+                return track.hash in self._checked_hashes
+            if key == "on_device":
+                return track.hash in self._device_hashes
             value = getattr(track, key)
             if key in ("track_number", "track_total", "disc_number", "year", "size"):
                 try:
