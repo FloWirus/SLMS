@@ -25,7 +25,8 @@ TEMPLATE_FIELDS = {
 
 
 def sanitize_component(value: str) -> str:
-    value = INVALID_CHARS_RE.sub("_", value)
+    value = INVALID_CHARS_RE.sub("", value)
+    value = re.sub(r" {2,}", " ", value)
     return value.strip().strip(".") or "_"
 
 

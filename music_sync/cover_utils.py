@@ -5,15 +5,16 @@ METERS_PER_INCH = 0.0254
 
 
 def resize_cover_bytes(data: bytes, mime: str, max_size: int, dpi: int) -> bytes:
-    """Scale the image so its longer side equals max_size (aspect ratio kept)
-    and stamp the given DPI into the output. A non-positive max_size or dpi
-    skips that step."""
+    """Scale the image down so its longer side equals max_size (aspect ratio
+    kept) and stamp the given DPI into the output. A non-positive max_size or
+    dpi skips that step. Never upscales — if the image is already at or below
+    max_size, its dimensions are left untouched."""
     image = QImage()
     image.loadFromData(data)
     if image.isNull():
         return data
 
-    if max_size and max_size > 0:
+    if max_size and max_size > 0 and max(image.width(), image.height()) > max_size:
         image = image.scaled(max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     if dpi and dpi > 0:
