@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS tracks (
     genre TEXT,
     format TEXT,
     size INTEGER,
-    mtime REAL
+    mtime REAL,
+    source_hash TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tracks_hash ON tracks(hash);
 """
@@ -32,6 +33,7 @@ class Track:
     path: str
     filename: str
     hash: str
+    source_hash: str = ""
     artist: str = ""
     album: str = ""
     title: str = ""
@@ -51,6 +53,7 @@ class Track:
             path=row["path"],
             filename=row["filename"],
             hash=row["hash"],
+            source_hash=row["source_hash"] or "",
             artist=row["artist"] or "",
             album=row["album"] or "",
             title=row["title"] or "",
@@ -83,6 +86,11 @@ class MusicDatabase:
         if "disc_number" not in columns:
             self.conn.execute("ALTER TABLE tracks ADD COLUMN disc_number TEXT")
             self.conn.commit()
+        if "source_hash" not in columns:
+            self.conn.execute("ALTER TABLE tracks ADD COLUMN source_hash TEXT DEFAULT ''")
+            self.conn.commit()
+        self.conn.execute("UPDATE tracks SET source_hash = hash WHERE source_hash IS NULL OR source_hash = ''")
+        self.conn.commit()
 
     def close(self):
         self.conn.close()
@@ -90,13 +98,14 @@ class MusicDatabase:
     def upsert_track(self, track: Track) -> int:
         cur = self.conn.execute(
             """
-            INSERT INTO tracks (path, filename, hash, artist, album, title,
+            INSERT INTO tracks (path, filename, hash, source_hash, artist, album, title,
                                  track_number, track_total, disc_number, year, genre, format, size, mtime)
-            VALUES (:path, :filename, :hash, :artist, :album, :title,
+            VALUES (:path, :filename, :hash, :source_hash, :artist, :album, :title,
                     :track_number, :track_total, :disc_number, :year, :genre, :format, :size, :mtime)
             ON CONFLICT(path) DO UPDATE SET
                 filename=excluded.filename,
                 hash=excluded.hash,
+                source_hash=excluded.source_hash,
                 artist=excluded.artist,
                 album=excluded.album,
                 title=excluded.title,
@@ -128,7 +137,7 @@ class MusicDatabase:
 
     def all_tracks(self) -> list[Track]:
         rows = self.conn.execute(
-            "SELECT * FROM tracks ORDER BY artist, album, disc_number, track_number"
+            "SELECT * FROM tracks ORDER BY artist, album, CAST(disc_number AS INTEGER), CAST(track_number AS INTEGER)"
         ).fetchall()
         return [Track.from_row(r) for r in rows]
 
@@ -138,6 +147,14 @@ class MusicDatabase:
 
     def get_by_hash(self, hash_: str) -> Track | None:
         row = self.conn.execute("SELECT * FROM tracks WHERE hash = ?", (hash_,)).fetchone()
+        return Track.from_row(row) if row else None
+
+    def source_hashes(self) -> set[str]:
+        rows = self.conn.execute("SELECT source_hash FROM tracks").fetchall()
+        return {r["source_hash"] for r in rows}
+
+    def get_by_source_hash(self, hash_: str) -> Track | None:
+        row = self.conn.execute("SELECT * FROM tracks WHERE source_hash = ?", (hash_,)).fetchone()
         return Track.from_row(row) if row else None
 
     def get_by_path(self, path: str) -> Track | None:

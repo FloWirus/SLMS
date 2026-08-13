@@ -1,5 +1,5 @@
-from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .. import converter
 from ..i18n import available_languages, tr
 from ..settings import Settings
 
@@ -32,14 +33,6 @@ class SettingsDialog(QDialog):
         form.addRow(tr("label_dir_template"), self.dir_template_edit)
         form.addRow(tr("label_filename_template"), self.filename_template_edit)
 
-        self.cover_size_edit = QLineEdit(str(self._settings.cover_max_size))
-        self.cover_size_edit.setValidator(QIntValidator(1, 10000, self))
-        form.addRow(tr("label_cover_size"), self.cover_size_edit)
-
-        self.cover_dpi_edit = QLineEdit(str(self._settings.cover_dpi))
-        self.cover_dpi_edit.setValidator(QIntValidator(1, 2400, self))
-        form.addRow(tr("label_cover_dpi"), self.cover_dpi_edit)
-
         self.language_combo = QComboBox()
         for code in available_languages():
             self.language_combo.addItem(_language_display_name(code), code)
@@ -55,6 +48,21 @@ class SettingsDialog(QDialog):
         if theme_index >= 0:
             self.theme_combo.setCurrentIndex(theme_index)
         form.addRow(tr("label_theme"), self.theme_combo)
+
+        self.libsoxr_checkbox = QCheckBox(tr("chk_use_libsoxr"))
+        self.libsoxr_checkbox.setChecked(self._settings.use_libsoxr)
+        if converter.libsoxr_available():
+            self.libsoxr_checkbox.setToolTip(tr("chk_use_libsoxr_tooltip"))
+        else:
+            self.libsoxr_checkbox.setChecked(False)
+            self.libsoxr_checkbox.setEnabled(False)
+            self.libsoxr_checkbox.setToolTip(tr("chk_use_libsoxr_unavailable_tooltip"))
+        form.addRow("", self.libsoxr_checkbox)
+
+        self.track_no_fix_checkbox = QCheckBox(tr("chk_track_no_fix"))
+        self.track_no_fix_checkbox.setChecked(self._settings.track_no_fix)
+        self.track_no_fix_checkbox.setToolTip(tr("chk_track_no_fix_tooltip"))
+        form.addRow("", self.track_no_fix_checkbox)
 
         layout.addLayout(form)
 
@@ -87,8 +95,14 @@ class SettingsDialog(QDialog):
             last_source_root=self._settings.last_source_root,
             language=self.language_combo.currentData(),
             theme=self.theme_combo.currentData(),
-            cover_max_size=int(self.cover_size_edit.text() or self._settings.cover_max_size),
-            cover_dpi=int(self.cover_dpi_edit.text() or self._settings.cover_dpi),
+            use_libsoxr=self.libsoxr_checkbox.isChecked(),
+            track_no_fix=self.track_no_fix_checkbox.isChecked(),
+            profiles=self._settings.profiles,
+            last_profile_name=self._settings.last_profile_name,
+            table_header_state=self._settings.table_header_state,
+            device_table_header_state=self._settings.device_table_header_state,
+            tree_header_state=self._settings.tree_header_state,
+            device_tree_header_state=self._settings.device_tree_header_state,
         )
 
 

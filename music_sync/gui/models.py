@@ -1,5 +1,6 @@
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 
+from .. import tags as tagsmod
 from ..db import Track
 from ..i18n import tr
 from .icons import checkbox_icon, full_presence_icon
@@ -118,13 +119,15 @@ class TrackTableModel(QAbstractTableModel):
             return None
 
         if key == "on_device":
-            if role == Qt.DecorationRole and track.hash in self._device_hashes:
+            if role == Qt.DecorationRole and track.source_hash in self._device_hashes:
                 return full_presence_icon()
             return None
 
         if role == Qt.DisplayRole:
             if key == "size":
                 return format_size(track.size)
+            if key == "track_number":
+                return tagsmod.fix_track_number(track.track_number)
             return getattr(track, key)
 
         if role == Qt.UserRole:
@@ -141,7 +144,7 @@ class TrackTableModel(QAbstractTableModel):
             if key == "checked":
                 return track.hash in self._checked_hashes
             if key == "on_device":
-                return track.hash in self._device_hashes
+                return track.source_hash in self._device_hashes
             value = getattr(track, key)
             if key in ("track_number", "track_total", "disc_number", "year", "size"):
                 try:

@@ -20,7 +20,6 @@ from .. import tags as tagsmod
 from ..db import Track
 from ..i18n import tr
 from ..settings import Settings
-from .cover_utils import resize_cover_bytes
 
 COVER_SIZE = 150
 DIALOG_MIN_SIZE = (650, 480)
@@ -166,13 +165,11 @@ class AlbumEditDialog(QDialog):
             return
         image_path = Path(path)
         mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
-        resized_bytes = resize_cover_bytes(
-            image_path.read_bytes(), mime, self.settings.cover_max_size, self.settings.cover_dpi
-        )
-        self._new_cover_bytes = resized_bytes
+        cover_bytes = image_path.read_bytes()
+        self._new_cover_bytes = cover_bytes
         self._new_cover_mime = mime
         pixmap = QPixmap()
-        pixmap.loadFromData(resized_bytes)
+        pixmap.loadFromData(cover_bytes)
         self.cover_label.setPixmap(
             pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )

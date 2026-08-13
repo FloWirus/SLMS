@@ -1,14 +1,18 @@
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -26,6 +30,13 @@ from PySide6.QtCore import QSortFilterProxyModel
 
 from .. import devices as devicesmod
 from .. import tags as tagsmod
+from ..converter import (
+    CONVERSION_TARGET_ORDER,
+    CONVERSION_TARGETS,
+    ConversionSettings,
+    CoverResizeSettings,
+    ffmpeg_available,
+)
 from ..db import MusicDatabase, Track, device_db_path, library_db_path
 from ..i18n import set_language, tr
 from ..scanner import hash_file, scan_directory
@@ -61,8 +72,42 @@ class MainWindow(QMainWindow):
         self.resize(1000, 650)
 
         self._build_ui()
+        self._restore_header_states()
+
+        if self.settings.last_profile_name:
+            idx = self.profile_combo.findData(self.settings.last_profile_name)
+            if idx >= 0:
+                self.profile_combo.setCurrentIndex(idx)
+
         self._refresh_devices()
         self._restore_last_source()
+
+    def closeEvent(self, event):
+        self._save_header_states()
+        self.settings.save(self.project_root)
+        super().closeEvent(event)
+
+    def _restore_header_states(self):
+        self._restore_header_state(self.table_view.horizontalHeader(), self.settings.table_header_state)
+        self._restore_header_state(self.device_table_view.horizontalHeader(), self.settings.device_table_header_state)
+        self._restore_header_state(self.tree_widget.header(), self.settings.tree_header_state)
+        self._restore_header_state(self.device_tree_widget.header(), self.settings.device_tree_header_state)
+
+    def _save_header_states(self):
+        self.settings.table_header_state = self._header_state_to_str(self.table_view.horizontalHeader())
+        self.settings.device_table_header_state = self._header_state_to_str(self.device_table_view.horizontalHeader())
+        self.settings.tree_header_state = self._header_state_to_str(self.tree_widget.header())
+        self.settings.device_tree_header_state = self._header_state_to_str(self.device_tree_widget.header())
+
+    @staticmethod
+    def _header_state_to_str(header) -> str:
+        return bytes(header.saveState()).hex()
+
+    @staticmethod
+    def _restore_header_state(header, state: str) -> None:
+        if not state:
+            return
+        header.restoreState(QByteArray.fromHex(state.encode()))
 
     # ---------- UI construction ----------
 
@@ -92,9 +137,10 @@ class MainWindow(QMainWindow):
         self.device_table_view.customContextMenuRequested.disconnect()
         self.device_table_view.doubleClicked.disconnect()
         self.device_table_view.customContextMenuRequested.connect(self._device_table_context_menu)
+        self.device_table_view.doubleClicked.connect(self._edit_selected_device_table_track)
         self.device_table_model = self.device_table_view.model().sourceModel()
         self.device_proxy_model = self.device_table_view.model()
-        self.device_tree_widget = self._build_tree_widget(self._device_tree_context_menu, None)
+        self.device_tree_widget = self._build_tree_widget(self._device_tree_context_menu, self._edit_device_tree_item)
         device_pane = self._build_pane(
             tr("pane_device_title"), self.device_table_view, self.device_tree_widget, self._sync_checked_device_tree
         )
@@ -106,6 +152,149 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel(tr("status_choose_directory"))
         layout.addWidget(self.status_label, 0)
+
+        conversion_bar = self._build_conversion_bar()
+        cover_resize_bar = self._build_cover_resize_bar()
+        profile_bar = self._build_profile_bar()
+
+        layout.addLayout(profile_bar)
+        layout.addLayout(conversion_bar)
+        layout.addLayout(cover_resize_bar)
+
+    def _build_profile_bar(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addStretch()
+
+        row.addWidget(QLabel(tr("label_profile")))
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(160)
+        self._populate_profile_combo()
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
+        row.addWidget(self.profile_combo)
+
+        add_profile_btn = QPushButton(tr("btn_add_profile"))
+        add_profile_btn.clicked.connect(self._add_profile)
+        row.addWidget(add_profile_btn)
+
+        delete_profile_btn = QPushButton(tr("btn_delete_profile"))
+        delete_profile_btn.clicked.connect(self._delete_profile)
+        row.addWidget(delete_profile_btn)
+
+        row.addStretch()
+        return row
+
+    def _populate_profile_combo(self, select_name: str | None = None):
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItem("", None)
+        for profile in self.settings.profiles:
+            self.profile_combo.addItem(profile["name"], profile["name"])
+        if select_name:
+            idx = self.profile_combo.findData(select_name)
+            if idx >= 0:
+                self.profile_combo.setCurrentIndex(idx)
+        self.profile_combo.blockSignals(False)
+
+    def _add_profile(self):
+        name, ok = QInputDialog.getText(self, tr("dialog_add_profile_title"), tr("dialog_add_profile_label"))
+        name = name.strip()
+        if not ok or not name:
+            return
+
+        existing_names = {p["name"] for p in self.settings.profiles}
+        if name in existing_names:
+            reply = QMessageBox.question(self, tr("msg_profile_exists_title"), tr("msg_profile_exists_text", name=name))
+            if reply != QMessageBox.Yes:
+                return
+            self.settings.profiles = [p for p in self.settings.profiles if p["name"] != name]
+
+        profile = {
+            "name": name,
+            "dir_template": self.settings.dir_template,
+            "filename_template": self.settings.filename_template,
+            "convert_enabled": self.convert_checkbox.isChecked(),
+            "convert_target": self.convert_target_combo.currentData(),
+            "cover_resize_enabled": self.resize_cover_checkbox.isChecked(),
+            "cover_resize_size": self.cover_size_edit.text(),
+            "cover_resize_dpi": self.cover_dpi_edit.text(),
+        }
+        self.settings.profiles.append(profile)
+        self.settings.last_profile_name = name
+        self.settings.save(self.project_root)
+        self._populate_profile_combo(select_name=name)
+
+    def _delete_profile(self):
+        name = self.profile_combo.currentData()
+        if not name:
+            return
+        reply = QMessageBox.question(self, tr("msg_delete_profile_title"), tr("msg_delete_profile_text", name=name))
+        if reply != QMessageBox.Yes:
+            return
+        self.settings.profiles = [p for p in self.settings.profiles if p["name"] != name]
+        if self.settings.last_profile_name == name:
+            self.settings.last_profile_name = ""
+        self.settings.save(self.project_root)
+        self._populate_profile_combo()
+
+    def _on_profile_selected(self, index: int):
+        name = self.profile_combo.itemData(index)
+        if not name:
+            return
+        profile = next((p for p in self.settings.profiles if p["name"] == name), None)
+        if not profile:
+            return
+
+        self.settings.dir_template = profile.get("dir_template", self.settings.dir_template)
+        self.settings.filename_template = profile.get("filename_template", self.settings.filename_template)
+        self.convert_checkbox.setChecked(bool(profile.get("convert_enabled", False)))
+        target_idx = self.convert_target_combo.findData(profile.get("convert_target"))
+        if target_idx >= 0:
+            self.convert_target_combo.setCurrentIndex(target_idx)
+        self.resize_cover_checkbox.setChecked(bool(profile.get("cover_resize_enabled", False)))
+        self.cover_size_edit.setText(str(profile.get("cover_resize_size", "500")))
+        self.cover_dpi_edit.setText(str(profile.get("cover_resize_dpi", "72")))
+
+        self.settings.last_profile_name = name
+        self.settings.save(self.project_root)
+
+    def _build_conversion_bar(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addStretch()
+
+        self.convert_checkbox = QCheckBox(tr("chk_convert_on_sync"))
+        self.convert_checkbox.setToolTip(tr("chk_convert_on_sync_tooltip"))
+        row.addWidget(self.convert_checkbox)
+
+        self.convert_target_combo = QComboBox()
+        for key in CONVERSION_TARGET_ORDER:
+            self.convert_target_combo.addItem(tr(f"conversion_target_{key}"), key)
+        row.addWidget(self.convert_target_combo)
+
+        row.addStretch()
+        return row
+
+    def _build_cover_resize_bar(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addStretch()
+
+        self.resize_cover_checkbox = QCheckBox(tr("chk_resize_cover_on_sync"))
+        self.resize_cover_checkbox.setToolTip(tr("chk_resize_cover_on_sync_tooltip"))
+        row.addWidget(self.resize_cover_checkbox)
+
+        row.addWidget(QLabel(tr("label_cover_size")))
+        self.cover_size_edit = QLineEdit("500")
+        self.cover_size_edit.setValidator(QIntValidator(1, 10000, self))
+        self.cover_size_edit.setMaximumWidth(70)
+        row.addWidget(self.cover_size_edit)
+
+        row.addWidget(QLabel(tr("label_cover_dpi")))
+        self.cover_dpi_edit = QLineEdit("72")
+        self.cover_dpi_edit.setValidator(QIntValidator(1, 2400, self))
+        self.cover_dpi_edit.setMaximumWidth(70)
+        row.addWidget(self.cover_dpi_edit)
+
+        row.addStretch()
+        return row
 
     def _build_toolbar(self) -> QGridLayout:
         grid = QGridLayout()
@@ -327,7 +516,7 @@ class MainWindow(QMainWindow):
         cancelled = progress.wasCanceled()
         progress.close()
 
-        self.device_hashes = self.device_db.hashes()
+        self.device_hashes = self.device_db.source_hashes()
         self._refresh_views()
         if cancelled:
             self.status_label.setText(tr("status_scan_cancelled", count=len(tracks)))
@@ -348,7 +537,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_device_views(self):
         tracks = self.device_db.all_tracks() if self.device_db else []
-        library_hashes = self.library_db.hashes() if self.library_db else set()
+        library_hashes = self.library_db.source_hashes() if self.library_db else set()
         self.device_table_model.set_tracks(tracks)
         self.device_table_model.set_device_hashes(library_hashes)
         self._populate_tree(self.device_tree_widget, tracks, library_hashes, self.device_checked_hashes)
@@ -378,13 +567,17 @@ class MainWindow(QMainWindow):
                     album_present_flags = []
                     album_checked_flags = []
                     for track in by_artist[artist][album]:
-                        label = f"{track.track_number}. {track.title}" if track.track_number else track.title
+                        label = (
+                            f"{tagsmod.fix_track_number(track.track_number)}. {track.title}"
+                            if track.track_number
+                            else track.title
+                        )
                         track_item = QTreeWidgetItem([label, track.year, track.format])
                         track_item.setData(0, Qt.UserRole, {"type": "track", "track": track})
                         track_item.setFlags(track_item.flags() | Qt.ItemIsUserCheckable)
                         checked = track.hash in checked_hashes
                         track_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
-                        present = track.hash in other_hashes
+                        present = track.source_hash in other_hashes
                         if present:
                             track_item.setIcon(0, full_presence_icon())
                         album_present_flags.append(present)
@@ -541,7 +734,7 @@ class MainWindow(QMainWindow):
             self.device_db = None
         if self.selected_device:
             self.device_db = MusicDatabase(device_db_path(Path(self.selected_device.mountpoint)))
-            self.device_hashes = self.device_db.hashes()
+            self.device_hashes = self.device_db.source_hashes()
         else:
             self.device_hashes = set()
         self._refresh_views()
@@ -596,6 +789,25 @@ class MainWindow(QMainWindow):
         if not tracks:
             return
 
+        conversion = None
+        if self.convert_checkbox.isChecked():
+            if not ffmpeg_available():
+                QMessageBox.critical(self, tr("msg_ffmpeg_missing_title"), tr("msg_ffmpeg_missing_text"))
+                return
+            conversion = ConversionSettings(
+                target_key=self.convert_target_combo.currentData(),
+                use_libsoxr=self.settings.use_libsoxr,
+            )
+
+        cover_resize = None
+        if self.resize_cover_checkbox.isChecked():
+            size_text = self.cover_size_edit.text().strip()
+            dpi_text = self.cover_dpi_edit.text().strip()
+            if not size_text or not dpi_text:
+                QMessageBox.critical(self, tr("msg_cover_resize_invalid_title"), tr("msg_cover_resize_invalid_text"))
+                return
+            cover_resize = CoverResizeSettings(max_size=int(size_text), dpi=int(dpi_text))
+
         reply = QMessageBox.question(
             self,
             tr("confirm_sync_title"),
@@ -632,6 +844,9 @@ class MainWindow(QMainWindow):
             self.settings.filename_template,
             on_conflict=on_conflict,
             on_progress=on_progress,
+            conversion=conversion,
+            cover_resize=cover_resize,
+            track_no_fix=self.settings.track_no_fix,
         )
         progress.close()
 
@@ -760,6 +975,7 @@ class MainWindow(QMainWindow):
             path=fields["path"],
             filename=new_path.name,
             hash=new_hash,
+            source_hash=new_hash,
             artist=fields["artist"],
             album=fields["album"],
             title=fields["title"],
@@ -775,6 +991,117 @@ class MainWindow(QMainWindow):
         if updated.path != old_track.path:
             self.library_db.delete_by_path(old_track.path)
         self.library_db.upsert_track(updated)
+        return updated
+
+    def _device_table_ordered_tracks(self) -> list[Track]:
+        tracks = []
+        for row in range(self.device_proxy_model.rowCount()):
+            source_row = self.device_proxy_model.mapToSource(self.device_proxy_model.index(row, 0)).row()
+            tracks.append(self.device_table_model.track_at(source_row))
+        return tracks
+
+    def _flatten_device_tree_tracks(self) -> list[Track]:
+        tracks = []
+        for i in range(self.device_tree_widget.topLevelItemCount()):
+            artist_item = self.device_tree_widget.topLevelItem(i)
+            for j in range(artist_item.childCount()):
+                album_item = artist_item.child(j)
+                for k in range(album_item.childCount()):
+                    data = album_item.child(k).data(0, Qt.UserRole) or {}
+                    if data.get("type") == "track":
+                        tracks.append(data["track"])
+        return tracks
+
+    def _flatten_device_tree_albums(self) -> list[list[Track]]:
+        albums = []
+        for i in range(self.device_tree_widget.topLevelItemCount()):
+            artist_item = self.device_tree_widget.topLevelItem(i)
+            for j in range(artist_item.childCount()):
+                album_item = artist_item.child(j)
+                tracks = []
+                for k in range(album_item.childCount()):
+                    data = album_item.child(k).data(0, Qt.UserRole) or {}
+                    if data.get("type") == "track":
+                        tracks.append(data["track"])
+                if tracks:
+                    albums.append(tracks)
+        return albums
+
+    def _edit_selected_device_table_track(self, proxy_index):
+        tracks = self._device_table_ordered_tracks()
+        self._edit_device_track_sequence(tracks, proxy_index.row())
+
+    def _edit_device_tree_item(self, item: QTreeWidgetItem, column: int):
+        data = item.data(0, Qt.UserRole) or {}
+        if data.get("type") != "track":
+            return
+        tracks = self._flatten_device_tree_tracks()
+        index = tracks.index(data["track"]) if data["track"] in tracks else 0
+        self._edit_device_track_sequence(tracks, index)
+
+    def _edit_device_track_sequence(self, tracks: list[Track], start_index: int):
+        if not self.selected_device or not self.device_db or not tracks:
+            return
+        dialog = TagEditDialog(
+            Path(self.selected_device.mountpoint),
+            tracks,
+            start_index,
+            on_saved=self._persist_device_track_edit,
+            settings=self.settings,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_views()
+
+    def _edit_device_album_tags(self, artist: str, album: str):
+        if not self.selected_device or not self.device_db:
+            return
+        albums = self._flatten_device_tree_albums()
+        if not albums:
+            return
+        start_index = 0
+        for idx, tracks in enumerate(albums):
+            first = tracks[0]
+            if (first.artist or tr("unknown_artist")) == artist and (first.album or tr("unknown_album")) == album:
+                start_index = idx
+                break
+        dialog = AlbumEditDialog(
+            Path(self.selected_device.mountpoint),
+            albums,
+            start_index,
+            on_saved=self._persist_device_track_edit,
+            settings=self.settings,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_views()
+
+    def _persist_device_track_edit(self, old_track: Track, fields: dict) -> Track:
+        device_root = Path(self.selected_device.mountpoint)
+        new_path = device_root / fields["path"]
+        new_hash = hash_file(new_path)
+        stat = new_path.stat()
+        updated = Track(
+            id=old_track.id,
+            path=fields["path"],
+            filename=new_path.name,
+            hash=new_hash,
+            source_hash=old_track.source_hash,
+            artist=fields["artist"],
+            album=fields["album"],
+            title=fields["title"],
+            track_number=fields["track_number"],
+            track_total=fields["track_total"],
+            disc_number=fields["disc_number"],
+            year=fields["year"],
+            genre=fields["genre"],
+            format=old_track.format,
+            size=stat.st_size,
+            mtime=stat.st_mtime,
+        )
+        if updated.path != old_track.path:
+            self.device_db.delete_by_path(old_track.path)
+        self.device_db.upsert_track(updated)
         return updated
 
     # ---------- context menus ----------
@@ -803,35 +1130,61 @@ class MainWindow(QMainWindow):
         elif item_type == "album":
             self._show_album_menu(global_pos, data["artist"], data["album"])
         elif item_type == "artist":
-            self._show_group_menu(
-                global_pos,
-                label=tr("menu_sync_artist", artist=data["artist"]),
-                tracks_provider=lambda: self._tracks_for_artist(data["artist"]),
-                description=tr("sync_artist_description", artist=data["artist"]),
-            )
+            self._show_artist_menu(global_pos, data["artist"])
 
     def _device_table_context_menu(self, pos):
         index = self.device_table_view.indexAt(pos)
         if not index.isValid():
             return
+        tracks = self._device_table_ordered_tracks()
         source_row = self.device_proxy_model.mapToSource(self.device_proxy_model.index(index.row(), 0)).row()
         track = self.device_table_model.track_at(source_row)
-        self._show_device_track_menu(track, self.device_table_view.viewport().mapToGlobal(pos))
+        self._show_device_track_menu(track, tracks, index.row(), self.device_table_view.viewport().mapToGlobal(pos))
 
     def _device_tree_context_menu(self, pos):
         item = self.device_tree_widget.itemAt(pos)
         if not item:
             return
         data = item.data(0, Qt.UserRole) or {}
-        if data.get("type") == "track":
-            self._show_device_track_menu(data["track"], self.device_tree_widget.viewport().mapToGlobal(pos))
+        item_type = data.get("type")
+        global_pos = self.device_tree_widget.viewport().mapToGlobal(pos)
 
-    def _show_device_track_menu(self, device_track: Track, global_pos):
+        if item_type == "track":
+            tracks = self._flatten_device_tree_tracks()
+            track = data["track"]
+            index = tracks.index(track) if track in tracks else 0
+            self._show_device_track_menu(track, tracks, index, global_pos)
+        elif item_type == "album":
+            self._show_device_album_menu(global_pos, data["artist"], data["album"])
+        elif item_type == "artist":
+            self._show_device_artist_menu(global_pos, data["artist"])
+
+    def _show_device_track_menu(self, device_track: Track, tracks: list[Track], index: int, global_pos):
         menu = QMenu(self)
+        edit_action = menu.addAction(tr("menu_edit_tags"))
         delete_action = menu.addAction(tr("menu_delete_from_device"))
         action = menu.exec(global_pos)
-        if action == delete_action:
+        if action == edit_action:
+            self._edit_device_track_sequence(tracks, index)
+        elif action == delete_action:
             self._delete_device_track(device_track)
+
+    def _show_device_album_menu(self, global_pos, artist: str, album: str):
+        menu = QMenu(self)
+        edit_action = menu.addAction(tr("menu_edit_album_tags", album=album))
+        delete_action = menu.addAction(tr("menu_delete_album_from_device"))
+        action = menu.exec(global_pos)
+        if action == edit_action:
+            self._edit_device_album_tags(artist, album)
+        elif action == delete_action:
+            self._delete_device_album(artist, album)
+
+    def _show_device_artist_menu(self, global_pos, artist: str):
+        menu = QMenu(self)
+        delete_action = menu.addAction(tr("menu_delete_artist_from_device"))
+        action = menu.exec(global_pos)
+        if action == delete_action:
+            self._delete_device_artist(artist)
 
     def _delete_device_track(self, device_track: Track):
         if not self.selected_device:
@@ -844,44 +1197,49 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        if self.device_db:
-            self.device_db.close()
-            self.device_db = None
-        delete_from_device(Path(self.selected_device.mountpoint), device_track)
-        self._on_device_selected(self.device_combo.currentIndex())
+        self._delete_device_tracks([device_track])
 
     def _show_track_menu(self, track: Track, tracks: list[Track], index: int, global_pos):
         menu = QMenu(self)
         edit_action = menu.addAction(tr("menu_edit_tags"))
         sync_action = menu.addAction(tr("menu_sync_track"))
-        delete_action = None
-        if self.selected_device and track.hash in self.device_hashes:
-            delete_action = menu.addAction(tr("menu_delete_from_device"))
+        delete_device_action = None
+        if self.selected_device and track.source_hash in self.device_hashes:
+            delete_device_action = menu.addAction(tr("menu_delete_from_device"))
+        delete_action = menu.addAction(tr("menu_delete_track"))
 
         action = menu.exec(global_pos)
         if action == edit_action:
             self._edit_track_sequence(tracks, index)
         elif action == sync_action:
             self._sync_tracks([track], tr("sync_track_description", title=track.title))
-        elif delete_action and action == delete_action:
+        elif delete_device_action and action == delete_device_action:
             self._delete_from_device(track)
+        elif action == delete_action:
+            self._delete_library_track(track)
 
-    def _show_group_menu(self, global_pos, label: str, tracks_provider, description: str):
+    def _show_artist_menu(self, global_pos, artist: str):
         menu = QMenu(self)
-        sync_action = menu.addAction(label)
+        sync_action = menu.addAction(tr("menu_sync_artist", artist=artist))
+        delete_action = menu.addAction(tr("menu_delete_artist"))
         action = menu.exec(global_pos)
         if action == sync_action:
-            self._sync_tracks(tracks_provider(), description)
+            self._sync_tracks(self._tracks_for_artist(artist), tr("sync_artist_description", artist=artist))
+        elif action == delete_action:
+            self._delete_library_artist(artist)
 
     def _show_album_menu(self, global_pos, artist: str, album: str):
         menu = QMenu(self)
         edit_action = menu.addAction(tr("menu_edit_album_tags", album=album))
         sync_action = menu.addAction(tr("menu_sync_album", album=album))
+        delete_action = menu.addAction(tr("menu_delete_album"))
         action = menu.exec(global_pos)
         if action == edit_action:
             self._edit_album_tags(artist, album)
         elif action == sync_action:
             self._sync_tracks(self._tracks_for_album(artist, album), tr("sync_album_description", album=album))
+        elif action == delete_action:
+            self._delete_library_album(artist, album)
 
     def _flatten_tree_albums(self) -> list[list[Track]]:
         albums = []
@@ -919,10 +1277,107 @@ class MainWindow(QMainWindow):
     def _delete_from_device(self, track: Track):
         if not self.selected_device or not self.device_db:
             return
-        device_track = self.device_db.get_by_hash(track.hash)
+        device_track = self.device_db.get_by_source_hash(track.hash)
         if not device_track:
             return
         self._delete_device_track(device_track)
+
+    # ---------- deletion ----------
+
+    def _device_tracks_for_artist(self, artist: str) -> list[Track]:
+        return [t for t in self.device_db.all_tracks() if (t.artist or tr("unknown_artist")) == artist]
+
+    def _device_tracks_for_album(self, artist: str, album: str) -> list[Track]:
+        return [
+            t
+            for t in self.device_db.all_tracks()
+            if (t.artist or tr("unknown_artist")) == artist and (t.album or tr("unknown_album")) == album
+        ]
+
+    def _delete_library_tracks(self, tracks: list[Track]):
+        if not self.source_root or not self.library_db or not tracks:
+            return
+        for track in tracks:
+            file_path = self.source_root / track.path
+            if file_path.exists():
+                file_path.unlink()
+            self.library_db.delete_by_path(track.path)
+        self._refresh_views()
+
+    def _delete_library_track(self, track: Track):
+        reply = QMessageBox.question(
+            self, tr("confirm_delete_track_title"), tr("confirm_delete_track_text", title=track.title)
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._delete_library_tracks([track])
+
+    def _delete_library_album(self, artist: str, album: str):
+        tracks = self._tracks_for_album(artist, album)
+        if not tracks:
+            return
+        reply = QMessageBox.question(
+            self, tr("confirm_delete_album_title"), tr("confirm_delete_album_text", album=album, count=len(tracks))
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._delete_library_tracks(tracks)
+
+    def _delete_library_artist(self, artist: str):
+        tracks = self._tracks_for_artist(artist)
+        if not tracks:
+            return
+        reply = QMessageBox.question(
+            self, tr("confirm_delete_artist_title"), tr("confirm_delete_artist_text", artist=artist, count=len(tracks))
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._delete_library_tracks(tracks)
+
+    def _delete_device_tracks(self, tracks: list[Track]):
+        if not self.selected_device or not tracks:
+            return
+        if self.device_db:
+            self.device_db.close()
+            self.device_db = None
+        for track in tracks:
+            delete_from_device(Path(self.selected_device.mountpoint), track)
+        self._on_device_selected(self.device_combo.currentIndex())
+
+    def _delete_device_album(self, artist: str, album: str):
+        if not self.device_db:
+            return
+        tracks = self._device_tracks_for_album(artist, album)
+        if not tracks:
+            return
+        reply = QMessageBox.question(
+            self,
+            tr("confirm_delete_device_album_title"),
+            tr("confirm_delete_device_album_text", album=album, count=len(tracks), mount=self.selected_device.mountpoint),
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._delete_device_tracks(tracks)
+
+    def _delete_device_artist(self, artist: str):
+        if not self.device_db:
+            return
+        tracks = self._device_tracks_for_artist(artist)
+        if not tracks:
+            return
+        reply = QMessageBox.question(
+            self,
+            tr("confirm_delete_device_artist_title"),
+            tr(
+                "confirm_delete_device_artist_text",
+                artist=artist,
+                count=len(tracks),
+                mount=self.selected_device.mountpoint,
+            ),
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._delete_device_tracks(tracks)
 
     # ---------- settings ----------
 

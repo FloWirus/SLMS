@@ -168,6 +168,19 @@ def _apply_mp4_fields(audio: MP4, fields: dict) -> None:
             audio.pop("disk", None)
 
 
+def fix_track_number(value: str) -> str:
+    value = (value or "").strip()
+    if value.isdigit() and len(value) == 1:
+        return value.zfill(2)
+    return value
+
+
+def sniff_image_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG"):
+        return "image/png"
+    return "image/jpeg"
+
+
 def read_cover_art(path: Path) -> bytes | None:
     ext = path.suffix.lower()
     try:

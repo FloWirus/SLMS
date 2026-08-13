@@ -60,6 +60,7 @@ def scan_directory(
             path=rel_path,
             filename=path.name,
             hash=file_hash,
+            source_hash=file_hash,
             artist=tag_values["artist"],
             album=tag_values["album"],
             title=tag_values["title"],
