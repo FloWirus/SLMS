@@ -35,6 +35,36 @@ def _columns(presence_label: str = ""):
     return headers
 
 
+_POLISH_LETTER_RANK = {
+    "a": ord("a"),
+    "\u0105": ord("a") + 0.5,  # ą
+    "c": ord("c"),
+    "\u0107": ord("c") + 0.5,  # ć
+    "e": ord("e"),
+    "\u0119": ord("e") + 0.5,  # ę
+    "l": ord("l"),
+    "\u0142": ord("l") + 0.5,  # ł
+    "n": ord("n"),
+    "\u0144": ord("n") + 0.5,  # ń
+    "o": ord("o"),
+    "\u00f3": ord("o") + 0.5,  # ó
+    "s": ord("s"),
+    "\u015b": ord("s") + 0.5,  # ś
+    "z": ord("z"),
+    "\u017a": ord("z") + 0.3,  # ź
+    "\u017c": ord("z") + 0.6,  # ż
+}
+
+
+def polish_sort_key(value: str):
+    """Sort key placing Polish diacritic letters right after their base letter
+    (a, \u0105, b, c, \u0107, ... l, \u0142, m, ... z, \u017a, \u017c) instead
+    of after z. Each character contributes one rank, so words compare
+    correctly position by position regardless of length."""
+    lowered = value.lower()
+    return tuple(_POLISH_LETTER_RANK.get(ch, ord(ch)) for ch in lowered)
+
+
 def format_size(num_bytes: int) -> str:
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB"):
@@ -77,6 +107,9 @@ class TrackTableModel(QAbstractTableModel):
 
     def checked_tracks(self) -> list[Track]:
         return [t for t in self._tracks if t.hash in self._checked_hashes]
+
+    def all_checked(self) -> bool:
+        return bool(self._tracks) and all(t.hash in self._checked_hashes for t in self._tracks)
 
     def refresh_checked(self) -> None:
         if self._tracks:
@@ -151,7 +184,7 @@ class TrackTableModel(QAbstractTableModel):
                     return (0, float(value))
                 except (ValueError, TypeError):
                     return (1, 0.0)
-            return str(value).lower()
+            return polish_sort_key(str(value))
 
         self._tracks.sort(key=sort_key, reverse=reverse)
         self.layoutChanged.emit()

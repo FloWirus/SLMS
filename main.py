@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -36,10 +37,24 @@ def _migrate_legacy_data_dir(project_root: Path, data_dir: Path) -> None:
         shutil.move(str(old_dir), str(new_dir))
 
 
+def _setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
+
+
 def main():
+    _setup_logging()
+    logger = logging.getLogger(__name__)
+
     project_root = Path(__file__).resolve().parent
     data_dir = app_data_dir()
     _migrate_legacy_data_dir(project_root, data_dir)
+
+    logger.info("Uruchamianie SLMS (data_dir=%s)", data_dir)
 
     app = QApplication(sys.argv)
     app.setApplicationName("SLMS")

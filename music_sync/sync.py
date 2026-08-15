@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -9,8 +10,10 @@ from . import tags as tagsmod
 from .converter import ConversionSettings, CoverResizeSettings, convert_file, decide_conversion
 from .cover_utils import resize_cover_bytes
 from .db import MusicDatabase, Track, device_db_path
-from .scanner import hash_file
+from .scanner import hash_file, scan_directory
 from .templating import build_relative_target_path
+
+logger = logging.getLogger(__name__)
 
 
 class ConflictResolution(Enum):
@@ -97,6 +100,12 @@ def _copy_tracks(
     target_root = Path(target_root)
     result = SyncResult()
 
+    logger.info("Rozpoczynam synchronizacje: %d utworow -> %s", len(tracks), target_root)
+
+    # Files can be deleted from the target outside the app; drop their stale
+    # DB rows so they aren't mistaken for "already synced".
+    scan_directory(target_root, target_db)
+
     target_source_hashes = target_db.source_hashes()
 
     total = len(tracks)
@@ -105,8 +114,15 @@ def _copy_tracks(
             on_progress(index, total, track)
 
         if track.hash in target_source_hashes:
-            result.already_present += 1
-            continue
+            existing_entry = target_db.get_by_source_hash(track.hash)
+            if existing_entry and (target_root / existing_entry.path).exists():
+                result.already_present += 1
+                continue
+            # Registered but missing on disk (e.g. deleted mid-sync after the
+            # rescan above): drop the stale row and fall through to re-copy.
+            target_source_hashes.discard(track.hash)
+            if existing_entry:
+                target_db.delete_by_path(existing_entry.path)
 
         source_path = source_root / track.path
         spec = decide_conversion(track, source_path, conversion.target_key) if conversion else None
@@ -124,6 +140,7 @@ def _copy_tracks(
                 continue
             resolution = on_conflict(track, target_path)
             if resolution == ConflictResolution.SKIP:
+                logger.info("Pomijam (konflikt): %s", track.path)
                 result.skipped += 1
                 continue
 
@@ -148,9 +165,18 @@ def _copy_tracks(
             )
             target_source_hashes.add(track.hash)
             result.copied += 1
+            logger.info("Skopiowano [%d/%d]: %s -> %s", index, total, track.path, rel_target)
         except (OSError, subprocess.CalledProcessError) as exc:
+            logger.error("Blad kopiowania %s: %s", track.path, exc)
             result.errors.append(f"{track.path}: {exc}")
 
+    logger.info(
+        "Synchronizacja zakonczona: skopiowano=%d, pominieto=%d, juz_obecne=%d, bledy=%d",
+        result.copied,
+        result.skipped,
+        result.already_present,
+        len(result.errors),
+    )
     return result
 
 
@@ -208,11 +234,26 @@ def _register_track(
     target_db.upsert_track(registered_track)
 
 
+def remove_empty_parent_dirs(start_dir: Path, root: Path) -> None:
+    """Remove start_dir and any of its now-empty ancestors, stopping at (and
+    never removing) root itself."""
+    root = root.resolve()
+    current = start_dir.resolve()
+    while current != root and root in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
 def delete_from_device(device_mountpoint: Path, device_track: Track) -> None:
     device_mountpoint = Path(device_mountpoint)
     file_path = device_mountpoint / device_track.path
     if file_path.exists():
         file_path.unlink()
+        remove_empty_parent_dirs(file_path.parent, device_mountpoint)
     device_db = MusicDatabase(device_db_path(device_mountpoint))
     device_db.delete_by_path(device_track.path)
     device_db.close()
+    logger.info("Usunieto z urzadzenia: %s", device_track.path)

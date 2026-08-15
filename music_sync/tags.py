@@ -34,6 +34,54 @@ def read_tags(path: Path) -> dict:
     return result
 
 
+MEDIA_INFO_FIELDS = (
+    "codec",
+    "sample_rate",
+    "bit_depth",
+    "channels",
+    "duration",
+    "bitrate",
+    "file_size",
+)
+
+
+def read_media_info(path: Path) -> dict:
+    """Returns technical info about the audio stream (codec, sample rate, bit depth,
+    channels, duration in seconds, bitrate in bps, file size in bytes). Any value
+    that couldn't be determined is left as None.
+    """
+    result = {f: None for f in MEDIA_INFO_FIELDS}
+    try:
+        result["file_size"] = path.stat().st_size
+    except OSError:
+        pass
+
+    try:
+        audio = MutagenFile(str(path))
+    except Exception:
+        audio = None
+
+    if audio is None or audio.info is None:
+        return result
+
+    info = audio.info
+    result["sample_rate"] = getattr(info, "sample_rate", None)
+    result["bit_depth"] = getattr(info, "bits_per_sample", None)
+    result["channels"] = getattr(info, "channels", None)
+    result["duration"] = getattr(info, "length", None)
+    result["codec"] = (
+        getattr(info, "codec_description", None) or getattr(info, "codec", None) or path.suffix.lstrip(".").upper()
+    )
+
+    bitrate = getattr(info, "bitrate", None)
+    if bitrate:
+        result["bitrate"] = bitrate
+    elif result["duration"] and result["file_size"]:
+        result["bitrate"] = int(result["file_size"] * 8 / result["duration"])
+
+    return result
+
+
 def _split_track_number(value: str) -> tuple[str, str]:
     if not value:
         return "", ""

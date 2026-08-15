@@ -16,13 +16,14 @@ A simple Linux desktop app (PySide6) for cataloguing a local music library, edit
 - Edit the filename directly from the tag editor.
 - Manually picking a cover in the tag/album editor stores it as-is (no automatic resizing) — the library can hold covers at any resolution.
 - Next/Previous navigation while editing: track editor moves across all tracks (crossing album/artist boundaries); album editor moves between whole albums.
-- Detects mounted removable storage devices (via `lsblk`) and lets you pick a sync target from a dropdown.
+- Detects mounted removable storage devices (via `lsblk`) and lets you pick a sync target from a dropdown. Selecting/reconnecting a device automatically rescans it against what's actually on disk, so files deleted manually (outside the app) since the last connection are correctly detected as missing instead of still showing as present.
 - Two-way sync, run manually: library → device, or device → library. Never deletes files, and asks before overwriting a file that differs from the source.
 - Configurable directory/filename templates for the copies on the device, using placeholders: `{artist} {album} {title} {track} {track_total} {disc} {year} {genre}` (zero-padded numbers). Plain text can be mixed in, e.g. `music/{artist}`.
 - Sync the whole library/device from the toolbar buttons, checked tracks from a pane's "Sync checked" button, or a single artist, album, or track from context menus.
 - The device gets its own database; tracks already present are marked with the presence icon (matched against the original library file's hash, so this still works correctly even if the copy on the device was transcoded/had its cover resized), and can be deleted from the device only (source file untouched) via the context menu.
-- Delete a track, whole album, or whole artist — from the library (permanently removes the files and their DB rows) or from a device only (source files untouched) — via the context menu on either side. Always asks for confirmation first.
-- Safe "Eject" button (`udisksctl unmount` + `power-off`) — same as your desktop's native eject.
+- Delete a track, whole album, or whole artist — from the library (permanently removes the files and their DB rows) or from a device only (source files untouched) — via the context menu on either side. Always asks for confirmation first, and cleans up any directories left empty by the deletion (e.g. deleting an artist's only album also removes the now-empty artist folder).
+- "MediaInfo…" context menu entry (library or device side) shows technical details read straight from the file: codec, sample rate, bit depth, channels, duration, bitrate, and file size.
+- Safe "Eject" button (`udisksctl unmount` + `power-off`) — same as your desktop's native eject. Runs in the background with a progress indicator, since unmounting can take a while to flush cached writes on slow SD cards — the app stays responsive instead of appearing to freeze.
 - English/Polish UI language (remembered; requires restart to switch) and Light/Dark/Auto theme (remembered; applies live, "Auto" follows the system theme).
 - Optional "Convert on sync" checkbox + format dropdown at the bottom of the window (FLAC 16/44.1, FLAC 24/44.1, FLAC 24/48, FLAC 24/96, MP3 320kbps CBR). When enabled, every track copied to a device during that sync is transcoded via `ffmpeg` to the selected format — useful for players that don't need/support high-res FLAC. Only ever applies library → device (device → PC sync is always an untouched copy), never upsamples lossy sources or lossless sources already at/below the target, and its own checkbox state is not remembered between sessions. An optional libsoxr resampler can be enabled in Settings (remembered), if your ffmpeg build supports it.
 - A second, independent "Resize cover art" checkbox + size (px)/DPI fields at the bottom of the window shrinks embedded cover art on tracks copied to a device during that sync, keeping the longer side at the given size (aspect ratio kept) and stamping the given DPI. Never upscales — a cover already at or below the target size is left untouched. Same rules as the conversion checkbox: only library → device, the library file's cover is never touched, and neither the checkbox nor the field values are remembered between sessions.
@@ -49,7 +50,7 @@ python3 -m venv .venv
 python3 main.py
 ```
 
-`main.py` automatically re-executes itself with the `.venv` interpreter if PySide6 isn't found in the system Python, so `python3 main.py` works regardless of whether the venv is activated.
+`main.py` automatically re-executes itself with the `.venv` interpreter if PySide6 isn't found in the system Python, so `python3 main.py` works regardless of whether the venv is activated. Run from a terminal to see live logging of scans, syncs, and device actions as they happen.
 
 ## Prebuilt AppImage
 
@@ -58,7 +59,7 @@ A portable, self-contained `SLMS-x86_64.AppImage` (no `.venv`/system Python requ
 ## Data locations
 
 - Library database and app settings (directory/filename templates, language, theme, TrackNoFix/libsoxr toggles, saved sync profiles, last used source directory, remembered column layout): `~/.local/share/SLMS/music_db/` (`library.db` and `settings.json`), respecting `$XDG_DATA_HOME` if set. Same location regardless of whether you run from source, `.venv`, or the AppImage — the executable's own location is never used, since an AppImage runs from a fresh temporary mountpoint on every launch.
-- On each synced device: `<device>/music_db/device.db`.
+- On each synced device: `<device>/.music_db/device.db` (dot-prefixed so it stays hidden from file managers on the device; older `music_db/` folders from earlier versions are migrated automatically).
 
 ## Project layout
 
@@ -82,6 +83,7 @@ music_sync/
     icons.py                  hand-drawn checkbox/presence icons
     tag_edit_dialog.py        single-track tag editor (Next/Previous)
     album_edit_dialog.py      album-wide tag editor (Next/Previous album)
+    media_info_dialog.py      read-only technical info dialog (codec, sample rate, bitrate, ...)
     settings_dialog.py        templates, language, theme, libsoxr/TrackNoFix toggles
     theme.py                  light/dark/auto palette handling
 ```
@@ -104,13 +106,14 @@ Prosta aplikacja desktopowa na Linuksa (PySide6) do katalogowania lokalnej bibli
 - Edycja nazwy pliku bezpośrednio z edytora tagów.
 - Ręczny wybór okładki w edytorze tagów/albumu zapisuje ją bez zmian (bez automatycznego skalowania) — biblioteka może trzymać okładki w dowolnej rozdzielczości.
 - Nawigacja Następny/Poprzedni podczas edycji: edytor utworu przechodzi przez wszystkie utwory (także między albumami/artystami); edytor albumu przechodzi między całymi albumami.
-- Wykrywanie podłączonych nośników wymiennych (przez `lsblk`) i wybór celu synchronizacji z listy.
+- Wykrywanie podłączonych nośników wymiennych (przez `lsblk`) i wybór celu synchronizacji z listy. Wybranie/ponowne podłączenie nośnika automatycznie skanuje go pod kątem faktycznej zawartości dysku, więc pliki usunięte ręcznie (poza aplikacją) od ostatniego podłączenia są poprawnie wykrywane jako brakujące, zamiast wciąż pokazywać się jako obecne.
 - Synchronizacja dwukierunkowa uruchamiana ręcznie: biblioteka → nośnik lub nośnik → biblioteka. Nigdy nic nie usuwa i pyta przed nadpisaniem pliku różniącego się od źródła.
 - Konfigurowalne szablony katalogów/nazw plików dla kopii na nośniku, oparte na znacznikach: `{artist} {album} {title} {track} {track_total} {disc} {year} {genre}` (liczby dopełniane zerami). Można mieszać z dowolnym tekstem, np. `muzyka/{artist}`.
 - Synchronizacja całej biblioteki/nośnika z przycisków na pasku narzędzi, zaznaczonych utworów przyciskiem „Synchronizuj zaznaczone” w danym panelu, albo pojedynczego artysty, albumu lub utworu z menu kontekstowego.
 - Nośnik ma własną bazę danych; utwory już na nim obecne są oznaczone ikoną obecności (dopasowanie po hashu oryginalnego pliku z biblioteki, więc działa poprawnie nawet jeśli kopia na nośniku została przekonwertowana/miała zmniejszoną okładkę) i można je usunąć wyłącznie z nośnika (plik źródłowy pozostaje nietknięty) z menu kontekstowego.
-- Usuwanie utworu, całego albumu lub całego artysty — z biblioteki (trwale usuwa pliki i wpisy w bazie) albo tylko z nośnika (plik źródłowy nietknięty) — z menu kontekstowego po dowolnej stronie. Zawsze z prośbą o potwierdzenie.
-- Bezpieczny przycisk "Wysuń" (`udisksctl unmount` + `power-off`) — działa jak natywne wysuwanie w środowisku graficznym.
+- Usuwanie utworu, całego albumu lub całego artysty — z biblioteki (trwale usuwa pliki i wpisy w bazie) albo tylko z nośnika (plik źródłowy nietknięty) — z menu kontekstowego po dowolnej stronie. Zawsze z prośbą o potwierdzenie, a po usunięciu sprząta katalogi, które zostały puste (np. usunięcie jedynego albumu artysty usuwa też jego pusty już folder).
+- Pozycja menu kontekstowego „MediaInfo…” (po stronie biblioteki lub nośnika) pokazuje dane techniczne odczytane wprost z pliku: kodek, częstotliwość próbkowania, głębię bitową, liczbę kanałów, czas trwania, bitrate i rozmiar pliku.
+- Bezpieczny przycisk "Wysuń" (`udisksctl unmount` + `power-off`) — działa jak natywne wysuwanie w środowisku graficznym. Działa w tle z wskaźnikiem postępu, bo odmontowanie może chwilę potrwać przy zapisie bufora na wolniejsze karty SD — aplikacja zostaje responsywna zamiast sprawiać wrażenie zawieszonej.
 - Język interfejsu polski/angielski (zapamiętywany, zmiana wymaga restartu) oraz motyw Jasny/Ciemny/Auto (zapamiętywany, stosowany na żywo, "Auto" podąża za motywem systemowym).
 - Opcjonalny checkbox „Konwertuj przy synchronizacji” + rozwijana lista formatu na dole okna (FLAC 16/44,1, FLAC 24/44,1, FLAC 24/48, FLAC 24/96, MP3 320kbps CBR). Gdy włączony, każdy utwór kopiowany na nośnik podczas tej synchronizacji jest przekodowywany przez `ffmpeg` do wybranego formatu — przydatne dla odtwarzaczy, które nie potrzebują/nie obsługują FLAC wysokiej rozdzielczości. Dotyczy wyłącznie kierunku biblioteka → nośnik (synchronizacja nośnik → PC zawsze kopiuje bez zmian), nigdy nie podbija jakości plików stratnych ani bezstratnych już na poziomie targetu lub niższym, a stan samego checkboxa nie jest zapamiętywany między sesjami. Opcjonalny resampler libsoxr można włączyć w Ustawieniach (zapamiętywany), jeśli zainstalowany ffmpeg go obsługuje.
 - Drugi, niezależny checkbox „Resize okładki” + pola rozmiaru (px)/DPI na dole okna zmniejsza okładkę wbudowaną w utworach kopiowanych na urządzenie podczas tej synchronizacji, trzymając dłuższy bok na wpisanym rozmiarze (proporcje zachowane) i zapisując wpisane DPI. Nigdy nie powiększa — okładka już mniejsza lub równa docelowemu rozmiarowi zostaje bez zmian. Te same zasady co przy konwersji: dotyczy wyłącznie biblioteka → nośnik, okładka pliku w bibliotece nigdy nie jest ruszana, a ani checkbox, ani wpisane wartości nie są zapamiętywane między sesjami.
@@ -137,7 +140,7 @@ python3 -m venv .venv
 python3 main.py
 ```
 
-`main.py` automatycznie przełącza się na interpreter z `.venv`, jeśli PySide6 nie jest dostępne w systemowym Pythonie — więc `python3 main.py` działa niezależnie od tego, czy venv jest aktywowany.
+`main.py` automatycznie przełącza się na interpreter z `.venv`, jeśli PySide6 nie jest dostępne w systemowym Pythonie — więc `python3 main.py` działa niezależnie od tego, czy venv jest aktywowany. Uruchomienie z terminala pokazuje na żywo logi skanowań, synchronizacji i działań na nośniku.
 
 ## Gotowy AppImage
 
@@ -146,7 +149,7 @@ Przenośny, samodzielny plik `SLMS-x86_64.AppImage` (nie wymaga `.venv` ani syst
 ## Lokalizacja danych
 
 - Baza biblioteki i ustawienia aplikacji (szablony katalogu/nazwy pliku, język, motyw, przełączniki TrackNoFix/libsoxr, zapisane profile synchronizacji, ostatnio używany katalog źródłowy, zapamiętany układ kolumn): `~/.local/share/SLMS/music_db/` (`library.db` i `settings.json`), z uwzględnieniem `$XDG_DATA_HOME` jeśli jest ustawione. Ta sama lokalizacja niezależnie od tego, czy uruchamiasz z kodu źródłowego, `.venv`, czy z AppImage — lokalizacja samego pliku wykonywalnego nigdy nie jest używana, bo AppImage przy każdym uruchomieniu montuje się w innym tymczasowym katalogu.
-- Na każdym zsynchronizowanym nośniku: `<nośnik>/music_db/device.db`.
+- Na każdym zsynchronizowanym nośniku: `<nośnik>/.music_db/device.db` (nazwa z kropką, żeby pozostawał ukryty w menedżerach plików na nośniku; starsze foldery `music_db/` z wcześniejszych wersji są migrowane automatycznie).
 
 ## Struktura projektu
 
@@ -170,6 +173,7 @@ music_sync/
     icons.py                  ręcznie rysowane ikony checkboxa/obecności
     tag_edit_dialog.py        edytor tagów pojedynczego utworu (Następny/Poprzedni)
     album_edit_dialog.py      edytor tagów albumu (Następny/Poprzedni album)
+    media_info_dialog.py      okno tylko-do-odczytu z danymi technicznymi (kodek, próbkowanie, bitrate, ...)
     settings_dialog.py        szablony, język, motyw, przełączniki libsoxr/TrackNoFix
     theme.py                  obsługa palety jasny/ciemny/auto
 ```

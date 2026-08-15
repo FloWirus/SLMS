@@ -1,8 +1,12 @@
+import ctypes
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .constants import DB_DIRNAME, LIBRARY_DB_FILENAME, DEVICE_DB_FILENAME
+from .constants import DB_DIRNAME, DEVICE_DB_DIRNAME, LIBRARY_DB_FILENAME, DEVICE_DB_FILENAME
+
+FILE_ATTRIBUTE_HIDDEN = 0x02
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tracks (
@@ -72,6 +76,7 @@ class MusicDatabase:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        _hide_dir_windows(self.db_path.parent)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
@@ -175,4 +180,25 @@ def library_db_path(project_root: Path) -> Path:
 
 
 def device_db_path(device_mountpoint: Path) -> Path:
-    return Path(device_mountpoint) / DB_DIRNAME / DEVICE_DB_FILENAME
+    device_mountpoint = Path(device_mountpoint)
+    db_dir = device_mountpoint / DEVICE_DB_DIRNAME
+
+    # Migrate the old, visible directory name from earlier versions.
+    old_db_dir = device_mountpoint / DB_DIRNAME
+    if old_db_dir.is_dir() and not db_dir.exists():
+        old_db_dir.rename(db_dir)
+
+    _hide_dir_windows(db_dir)
+    return db_dir / DEVICE_DB_FILENAME
+
+
+def _hide_dir_windows(path: Path) -> None:
+    """Best-effort: set the Windows Hidden attribute so the folder stays
+    tucked away even in file managers that ignore dot-prefixes."""
+    if os.name != "nt":
+        return
+    try:
+        if path.is_dir():
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_HIDDEN)
+    except Exception:
+        pass
