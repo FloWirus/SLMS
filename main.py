@@ -21,6 +21,7 @@ from PySide6.QtWidgets import QApplication
 from music_sync.constants import DB_DIRNAME, app_data_dir
 from music_sync.gui.main_window import MainWindow
 from music_sync.gui.theme import apply_theme, init as init_theme
+from music_sync.i18n import set_language, tr
 from music_sync.settings import Settings
 
 
@@ -54,7 +55,10 @@ def main():
     data_dir = app_data_dir()
     _migrate_legacy_data_dir(project_root, data_dir)
 
-    logger.info("Uruchamianie SLMS (data_dir=%s)", data_dir)
+    # Set before the first log call so even this startup message respects the
+    # saved language (MainWindow re-applies it later; it's the same value).
+    set_language(Settings.load(data_dir).language)
+    logger.info(tr("log_starting", data_dir=data_dir))
 
     app = QApplication(sys.argv)
     app.setApplicationName("SLMS")

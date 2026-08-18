@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLabel, QVBoxLayout
 
 from ..i18n import tr
+from .models import format_size
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -15,17 +16,6 @@ def _format_duration(seconds: float | None) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
-
-
-def _format_size(num_bytes: int | None) -> str:
-    if not num_bytes:
-        return "-"
-    value = float(num_bytes)
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024 or unit == "GB":
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.2f} {unit}"
-        value /= 1024
-    return f"{num_bytes} B"
 
 
 class MediaInfoDialog(QDialog):
@@ -46,7 +36,8 @@ class MediaInfoDialog(QDialog):
         form.addRow(tr("field_mi_duration"), self._value_label(_format_duration(info.get("duration"))))
         bitrate = info.get("bitrate")
         form.addRow(tr("field_mi_bitrate"), self._value_label(f"{bitrate // 1000} kbps" if bitrate else "-"))
-        form.addRow(tr("field_mi_file_size"), self._value_label(_format_size(info.get("file_size"))))
+        file_size = info.get("file_size")
+        form.addRow(tr("field_mi_file_size"), self._value_label(format_size(file_size) if file_size else "-"))
 
         layout.addLayout(form)
 

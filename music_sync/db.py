@@ -76,7 +76,8 @@ class MusicDatabase:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        _hide_dir_windows(self.db_path.parent)
+        if self.db_path.parent.name == DEVICE_DB_DIRNAME:
+            _hide_dir_windows(self.db_path.parent)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)

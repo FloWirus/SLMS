@@ -52,6 +52,9 @@ def _collect(node: dict, devices: list[StorageDevice], disk_path: str) -> None:
         _collect(child, devices, disk_path=disk_path)
 
 
+EJECT_TIMEOUT_SECONDS = 60
+
+
 def eject_device(device: StorageDevice) -> tuple[bool, str]:
     """Safely unmount the partition and power off the underlying disk,
     equivalent to a desktop environment's "Eject" action."""
@@ -60,20 +63,29 @@ def eject_device(device: StorageDevice) -> tuple[bool, str]:
             ["udisksctl", "unmount", "-b", device.path],
             capture_output=True,
             text=True,
+            timeout=EJECT_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         return False, "udisksctl not found"
+    except subprocess.TimeoutExpired:
+        return False, "unmount timed out (a polkit prompt may be waiting for authorization)"
     if result.returncode != 0:
         return False, result.stderr.strip() or result.stdout.strip() or "unmount failed"
 
+    # The unmount above already succeeded -- the device is safe to remove
+    # even if power-off below stalls or fails, so those cases still report
+    # overall success (with a warning message) instead of blocking forever.
     try:
         result = subprocess.run(
             ["udisksctl", "power-off", "-b", device.disk_path],
             capture_output=True,
             text=True,
+            timeout=EJECT_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         return True, ""
+    except subprocess.TimeoutExpired:
+        return True, "power-off timed out (a polkit prompt may be waiting for authorization)"
     if result.returncode != 0:
         return True, result.stderr.strip() or result.stdout.strip()
 

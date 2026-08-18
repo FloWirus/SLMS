@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QSplitter,
@@ -49,6 +51,7 @@ from .media_info_dialog import MediaInfoDialog
 from .models import COLUMN_KEYS, TrackTableModel, polish_sort_key
 from .settings_dialog import SettingsDialog
 from .tag_edit_dialog import TagEditDialog
+from .theme import apply_theme
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +69,60 @@ class _EjectWorker(QObject):
     def run(self):
         success, error = devicesmod.eject_device(self.device)
         self.finished.emit(success, error)
-from .theme import apply_theme
+
+
+class _TransferProgressDialog(QDialog):
+    """Sync progress dialog with two bars: the top one tracks overall
+    progress across all tracks, the bottom one tracks progress through the
+    file currently being copied/converted."""
+
+    def __init__(self, initial_text: str, cancel_text: str | None, minimum: int, maximum: int, parent=None):
+        super().__init__(parent)
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        self._label = QLabel(initial_text)
+        layout.addWidget(self._label)
+        self._bar = QProgressBar()
+        self._bar.setMinimum(minimum)
+        self._bar.setMaximum(maximum)
+        layout.addWidget(self._bar)
+        self._file_bar = QProgressBar()
+        self._file_bar.setMinimum(0)
+        self._file_bar.setMaximum(0)
+        layout.addWidget(self._file_bar)
+        self._cancelled = False
+        if cancel_text:
+            button_row = QHBoxLayout()
+            button_row.addStretch()
+            cancel_btn = QPushButton(cancel_text)
+            cancel_btn.clicked.connect(self._cancel)
+            button_row.addWidget(cancel_btn)
+            layout.addLayout(button_row)
+
+    def _cancel(self):
+        self._cancelled = True
+
+    def wasCanceled(self) -> bool:
+        return self._cancelled
+
+    def setLabelText(self, text: str) -> None:
+        self._label.setText(text)
+
+    def setMaximum(self, value: int) -> None:
+        self._bar.setMaximum(value)
+
+    def setValue(self, value: int) -> None:
+        self._bar.setValue(value)
+
+    def setFileIndeterminate(self, format_text: str = "") -> None:
+        self._file_bar.setRange(0, 0)
+        self._file_bar.setFormat(format_text)
+
+    def setFileProgress(self, value: int, maximum: int) -> None:
+        self._file_bar.setRange(0, maximum)
+        self._file_bar.setValue(value)
+        self._file_bar.setFormat("%p%")
+
 
 APP_NAME = "SLMS"
 
@@ -488,11 +544,35 @@ class MainWindow(QMainWindow):
         count = len(self.library_db.all_tracks())
         self.status_label.setText(tr("status_loaded_library", count=count, path=self.source_root))
 
-    def _rescan_source(self):
-        if not self.source_root or not self.library_db:
-            QMessageBox.information(self, tr("msg_no_directory_title"), tr("msg_no_directory_text"))
-            return
+    def _make_transfer_progress_handler(self, progress: "_TransferProgressDialog"):
+        """Builds the on_transfer_progress callback for sync.py: drives the
+        dialog's second (per-file) progress bar -- indeterminate while a
+        transcode is running (ffmpeg gives no byte-level progress), otherwise
+        tracking bytes copied so far for a plain copy."""
 
+        def on_transfer_progress(
+            index: int,
+            total: int,
+            track: Track,
+            converting: bool,
+            bytes_copied: int | None,
+            total_bytes: int | None,
+        ):
+            progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
+            if converting:
+                progress.setFileIndeterminate(tr("progress_converting_label"))
+            elif bytes_copied is not None and total_bytes:
+                progress.setFileProgress(bytes_copied, total_bytes)
+            else:
+                progress.setFileIndeterminate()
+            QApplication.processEvents()
+
+        return on_transfer_progress
+
+    def _scan_with_progress(self, root: Path, db: MusicDatabase) -> tuple[list, bool]:
+        """Scan root and reconcile db with what's actually on disk (drops
+        stale rows for files removed outside the app), showing a progress
+        dialog. Returns the up-to-date tracks plus whether the user cancelled."""
         progress = QProgressDialog(tr("progress_scanning_label_initial"), tr("progress_cancel"), 0, 0, self)
         progress.setWindowTitle(f"{APP_NAME} — {tr('progress_scanning_title')}")
         progress.setWindowModality(Qt.WindowModal)
@@ -506,13 +586,21 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
         tracks = scan_directory(
-            self.source_root,
-            self.library_db,
+            root,
+            db,
             progress_callback=on_progress,
             should_stop=progress.wasCanceled,
         )
         cancelled = progress.wasCanceled()
         progress.close()
+        return tracks, cancelled
+
+    def _rescan_source(self):
+        if not self.source_root or not self.library_db:
+            QMessageBox.information(self, tr("msg_no_directory_title"), tr("msg_no_directory_text"))
+            return
+
+        tracks, cancelled = self._scan_with_progress(self.source_root, self.library_db)
 
         self._refresh_views()
         if cancelled:
@@ -535,30 +623,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(tr("status_scan_done", count=len(tracks), path=self.selected_device.mountpoint))
 
     def _scan_device_directory(self) -> tuple[list, bool]:
-        """Reconcile the device DB with the files actually on disk (drops
-        stale rows for files deleted outside the app) and return the
-        up-to-date tracks plus whether the user cancelled."""
-        progress = QProgressDialog(tr("progress_scanning_label_initial"), tr("progress_cancel"), 0, 0, self)
-        progress.setWindowTitle(f"{APP_NAME} — {tr('progress_scanning_title')}")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-
-        def on_progress(index: int, total: int, path: Path):
-            if total:
-                progress.setMaximum(total)
-                progress.setValue(index)
-            progress.setLabelText(tr("progress_scanning_label", index=index, total=total, name=path.name))
-            QApplication.processEvents()
-
-        tracks = scan_directory(
-            Path(self.selected_device.mountpoint),
-            self.device_db,
-            progress_callback=on_progress,
-            should_stop=progress.wasCanceled,
-        )
-        cancelled = progress.wasCanceled()
-        progress.close()
-        return tracks, cancelled
+        return self._scan_with_progress(Path(self.selected_device.mountpoint), self.device_db)
 
     def _refresh_views(self):
         self._refresh_source_views()
@@ -780,7 +845,13 @@ class MainWindow(QMainWindow):
             self.device_db.close()
             self.device_db = None
         if self.selected_device:
-            logger.info("Wybrano urzadzenie: %s (%s)", self.selected_device.label or self.selected_device.name, self.selected_device.mountpoint)
+            logger.info(
+                tr(
+                    "log_device_selected",
+                    label=self.selected_device.label or self.selected_device.name,
+                    mount=self.selected_device.mountpoint,
+                )
+            )
             self.device_db = MusicDatabase(device_db_path(Path(self.selected_device.mountpoint)))
             self._scan_device_directory()
             self.device_hashes = self.device_db.source_hashes()
@@ -798,7 +869,7 @@ class MainWindow(QMainWindow):
             self.device_db.close()
             self.device_db = None
 
-        logger.info("Rozpoczynam wysuwanie urzadzenia: %s", device.mountpoint)
+        logger.info(tr("log_eject_starting", mount=device.mountpoint))
 
         self._eject_progress = QProgressDialog(tr("progress_ejecting_label"), None, 0, 0, self)
         self._eject_progress.setWindowTitle(f"{APP_NAME} — {tr('progress_ejecting_title')}")
@@ -833,12 +904,12 @@ class MainWindow(QMainWindow):
         self._eject_device_pending = None
         if success:
             if error:
-                logger.warning("Odmontowano %s, ale power-off nie powiodl sie: %s", device.mountpoint, error)
+                logger.warning(tr("log_eject_poweroff_failed", mount=device.mountpoint, error=error))
             else:
-                logger.info("Odlaczono urzadzenie: %s", device.mountpoint)
+                logger.info(tr("log_eject_success", mount=device.mountpoint))
             QMessageBox.information(self, tr("msg_eject_success_title"), tr("msg_eject_success_text"))
         else:
-            logger.error("Blad odlaczania urzadzenia %s: %s", device.mountpoint, error)
+            logger.error(tr("log_eject_failed", mount=device.mountpoint, error=error))
             QMessageBox.critical(self, tr("msg_eject_failed_title"), tr("msg_eject_failed_text", error=error))
         self._refresh_devices()
 
@@ -915,16 +986,27 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        progress = QProgressDialog(tr("progress_sync_label_initial"), tr("progress_cancel"), 0, len(tracks), self)
+        progress = _TransferProgressDialog(
+            tr("progress_sync_label_initial"), tr("progress_cancel"), 0, len(tracks), self
+        )
         progress.setWindowTitle(f"{APP_NAME} — {tr('progress_sync_title')}")
         progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
+        progress.show()
+
+        def on_scan_progress(index, total, path: Path):
+            if total:
+                progress.setMaximum(total)
+                progress.setValue(index)
+            progress.setLabelText(tr("progress_scanning_label", index=index, total=total, name=path.name))
+            QApplication.processEvents()
 
         def on_progress(index, total, track: Track):
             progress.setMaximum(total)
             progress.setValue(index)
             progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
             QApplication.processEvents()
+
+        on_transfer_progress = self._make_transfer_progress_handler(progress)
 
         def on_conflict(track: Track, target_path: Path) -> ConflictResolution:
             reply = QMessageBox.question(
@@ -946,6 +1028,8 @@ class MainWindow(QMainWindow):
             conversion=conversion,
             cover_resize=cover_resize,
             track_no_fix=self.settings.track_no_fix,
+            on_scan_progress=on_scan_progress,
+            on_transfer_progress=on_transfer_progress,
         )
         progress.close()
 
@@ -979,16 +1063,27 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        progress = QProgressDialog(tr("progress_sync_label_initial"), tr("progress_cancel"), 0, len(tracks), self)
+        progress = _TransferProgressDialog(
+            tr("progress_sync_label_initial"), tr("progress_cancel"), 0, len(tracks), self
+        )
         progress.setWindowTitle(f"{APP_NAME} — {tr('progress_sync_title')}")
         progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
+        progress.show()
+
+        def on_scan_progress(index, total, path: Path):
+            if total:
+                progress.setMaximum(total)
+                progress.setValue(index)
+            progress.setLabelText(tr("progress_scanning_label", index=index, total=total, name=path.name))
+            QApplication.processEvents()
 
         def on_progress(index, total, track: Track):
             progress.setMaximum(total)
             progress.setValue(index)
             progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
             QApplication.processEvents()
+
+        on_transfer_progress = self._make_transfer_progress_handler(progress)
 
         def on_conflict(track: Track, target_path: Path) -> ConflictResolution:
             reply = QMessageBox.question(
@@ -1008,6 +1103,8 @@ class MainWindow(QMainWindow):
             self.settings.filename_template,
             on_conflict=on_conflict,
             on_progress=on_progress,
+            on_scan_progress=on_scan_progress,
+            on_transfer_progress=on_transfer_progress,
         )
         progress.close()
 
@@ -1463,8 +1560,23 @@ class MainWindow(QMainWindow):
         if self.device_db:
             self.device_db.close()
             self.device_db = None
-        for track in tracks:
-            delete_from_device(Path(self.selected_device.mountpoint), track)
+
+        progress = QProgressDialog(tr("progress_deleting_label_initial"), None, 0, len(tracks), self)
+        progress.setWindowTitle(f"{APP_NAME} — {tr('progress_deleting_title')}")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        mountpoint = Path(self.selected_device.mountpoint)
+        for index, track in enumerate(tracks, start=1):
+            progress.setValue(index - 1)
+            progress.setLabelText(tr("progress_deleting_label", index=index, total=len(tracks), name=track.filename))
+            QApplication.processEvents()
+            delete_from_device(mountpoint, track)
+        progress.setValue(len(tracks))
+        progress.close()
+
         self._on_device_selected(self.device_combo.currentIndex())
 
     def _delete_device_album(self, artist: str, album: str):

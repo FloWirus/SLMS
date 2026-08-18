@@ -1,6 +1,8 @@
 import logging
+import os
 import shutil
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -10,6 +12,7 @@ from . import tags as tagsmod
 from .converter import ConversionSettings, CoverResizeSettings, convert_file, decide_conversion
 from .cover_utils import resize_cover_bytes
 from .db import MusicDatabase, Track, device_db_path
+from .i18n import tr
 from .scanner import hash_file, scan_directory
 from .templating import build_relative_target_path
 
@@ -35,6 +38,58 @@ class SyncResult:
 
 ConflictCallback = Callable[[Track, Path], ConflictResolution]
 ProgressCallback = Callable[[int, int, Track], None]
+ScanProgressCallback = Callable[[int, int, Path], None]
+# index, total tracks, track, converting, bytes_copied, total_bytes.
+# For a converted file this fires once with converting=True and the byte
+# fields left None (conversion runs as one blocking ffmpeg call, no byte-level
+# progress available). For a plain copy it fires once at the start the same
+# way, then repeatedly as bytes are copied with converting=False and real figures.
+TransferProgressCallback = Callable[[int, int, Track, bool, int | None, int | None], None]
+
+COPY_CHUNK_SIZE = 256 * 1024
+COPY_FSYNC_INTERVAL = 0.15
+
+
+def _fsync_path(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDWR if os.name != "nt" else os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _copy_file_with_progress(source: Path, target: Path, on_chunk: Callable[[int, int], None] | None) -> None:
+    total = source.stat().st_size
+    if on_chunk is None or total == 0:
+        shutil.copy2(source, target)
+        _fsync_path(target)
+        return
+
+    copied = 0
+    last_fsync_time = time.monotonic()
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        while True:
+            chunk = src.read(COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            dst.write(chunk)
+            copied += len(chunk)
+            now = time.monotonic()
+            if now - last_fsync_time >= COPY_FSYNC_INTERVAL or copied == total:
+                # Periodically force these bytes out of the OS page cache and
+                # onto the device as we go, rather than leaving it all
+                # buffered until the file is closed -- limits how much data
+                # could be lost if the card is pulled mid-copy. Throttled by
+                # time since it's a slow, blocking syscall on removable
+                # media -- kept separate from the on_chunk() progress report
+                # below, which fires every chunk so the UI shows real,
+                # granular progress even for small files that finish in a
+                # single fsync interval.
+                dst.flush()
+                os.fsync(dst.fileno())
+                last_fsync_time = now
+            on_chunk(copied, total)
+    shutil.copystat(source, target)
 
 
 def sync_to_device(
@@ -48,6 +103,8 @@ def sync_to_device(
     conversion: ConversionSettings | None = None,
     cover_resize: CoverResizeSettings | None = None,
     track_no_fix: bool = False,
+    on_scan_progress: ScanProgressCallback | None = None,
+    on_transfer_progress: TransferProgressCallback | None = None,
 ) -> SyncResult:
     device_mountpoint = Path(device_mountpoint)
     device_db = MusicDatabase(device_db_path(device_mountpoint))
@@ -63,6 +120,8 @@ def sync_to_device(
         conversion,
         cover_resize,
         track_no_fix,
+        on_scan_progress,
+        on_transfer_progress,
     )
     device_db.close()
     return result
@@ -77,9 +136,20 @@ def sync_from_device(
     filename_template: str,
     on_conflict: ConflictCallback,
     on_progress: ProgressCallback | None = None,
+    on_scan_progress: ScanProgressCallback | None = None,
+    on_transfer_progress: TransferProgressCallback | None = None,
 ) -> SyncResult:
     return _copy_tracks(
-        device_mountpoint, tracks, target_root, target_db, dir_template, filename_template, on_conflict, on_progress
+        device_mountpoint,
+        tracks,
+        target_root,
+        target_db,
+        dir_template,
+        filename_template,
+        on_conflict,
+        on_progress,
+        on_scan_progress=on_scan_progress,
+        on_transfer_progress=on_transfer_progress,
     )
 
 
@@ -95,16 +165,21 @@ def _copy_tracks(
     conversion: ConversionSettings | None = None,
     cover_resize: CoverResizeSettings | None = None,
     track_no_fix: bool = False,
+    on_scan_progress: ScanProgressCallback | None = None,
+    on_transfer_progress: TransferProgressCallback | None = None,
 ) -> SyncResult:
     source_root = Path(source_root)
     target_root = Path(target_root)
     result = SyncResult()
 
-    logger.info("Rozpoczynam synchronizacje: %d utworow -> %s", len(tracks), target_root)
+    logger.info(tr("log_sync_start", count=len(tracks), target=target_root))
 
     # Files can be deleted from the target outside the app; drop their stale
-    # DB rows so they aren't mistaken for "already synced".
-    scan_directory(target_root, target_db)
+    # DB rows so they aren't mistaken for "already synced". Reports progress
+    # separately from on_progress since this scans the whole target, not the
+    # (usually smaller) list of tracks being synced — without this callback
+    # the GUI would sit unresponsive for however long this scan takes.
+    scan_directory(target_root, target_db, progress_callback=on_scan_progress)
 
     target_source_hashes = target_db.source_hashes()
 
@@ -115,11 +190,14 @@ def _copy_tracks(
 
         if track.hash in target_source_hashes:
             existing_entry = target_db.get_by_source_hash(track.hash)
-            if existing_entry and (target_root / existing_entry.path).exists():
+            existing_path = target_root / existing_entry.path if existing_entry else None
+            if existing_entry and existing_path.exists() and existing_path.stat().st_size > 0:
                 result.already_present += 1
                 continue
-            # Registered but missing on disk (e.g. deleted mid-sync after the
-            # rescan above): drop the stale row and fall through to re-copy.
+            # Registered but missing, or present as a zero-byte file (e.g.
+            # deleted mid-sync after the rescan above, or left truncated by a
+            # write that never made it to the device before it was removed):
+            # drop the stale row and fall through to re-copy.
             target_source_hashes.discard(track.hash)
             if existing_entry:
                 target_db.delete_by_path(existing_entry.path)
@@ -140,21 +218,30 @@ def _copy_tracks(
                 continue
             resolution = on_conflict(track, target_path)
             if resolution == ConflictResolution.SKIP:
-                logger.info("Pomijam (konflikt): %s", track.path)
+                logger.info(tr("log_sync_skip_conflict", path=track.path))
                 result.skipped += 1
                 continue
+
+        if on_transfer_progress:
+            on_transfer_progress(index, total, track, spec is not None, None, None)
 
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
             if spec is not None:
                 convert_file(source_path, target_path, spec, conversion.use_libsoxr)
+                _fsync_path(target_path)
                 file_format = spec.extension
             else:
-                shutil.copy2(source_path, target_path)
+                def _on_chunk(copied: int, total_bytes: int) -> None:
+                    on_transfer_progress(index, total, track, False, copied, total_bytes)
+
+                _copy_file_with_progress(source_path, target_path, _on_chunk if on_transfer_progress else None)
                 file_format = track.format
 
             cover_changed = _resize_target_cover(target_path, cover_resize) if cover_resize is not None else False
             track_no_fixed = _fix_target_track_number(target_path) if track_no_fix else False
+            if cover_changed or track_no_fixed:
+                _fsync_path(target_path)
             file_hash = (
                 hash_file(target_path) if (spec is not None or cover_changed or track_no_fixed) else track.hash
             )
@@ -165,17 +252,19 @@ def _copy_tracks(
             )
             target_source_hashes.add(track.hash)
             result.copied += 1
-            logger.info("Skopiowano [%d/%d]: %s -> %s", index, total, track.path, rel_target)
+            logger.info(tr("log_sync_copied", index=index, total=total, source=track.path, target=rel_target))
         except (OSError, subprocess.CalledProcessError) as exc:
-            logger.error("Blad kopiowania %s: %s", track.path, exc)
+            logger.error(tr("log_sync_copy_error", path=track.path, error=exc))
             result.errors.append(f"{track.path}: {exc}")
 
     logger.info(
-        "Synchronizacja zakonczona: skopiowano=%d, pominieto=%d, juz_obecne=%d, bledy=%d",
-        result.copied,
-        result.skipped,
-        result.already_present,
-        len(result.errors),
+        tr(
+            "log_sync_done",
+            copied=result.copied,
+            skipped=result.skipped,
+            present=result.already_present,
+            errors=len(result.errors),
+        )
     )
     return result
 
@@ -256,4 +345,4 @@ def delete_from_device(device_mountpoint: Path, device_track: Track) -> None:
     device_db = MusicDatabase(device_db_path(device_mountpoint))
     device_db.delete_by_path(device_track.path)
     device_db.close()
-    logger.info("Usunieto z urzadzenia: %s", device_track.path)
+    logger.info(tr("log_deleted_from_device", path=device_track.path))

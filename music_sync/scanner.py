@@ -53,6 +53,23 @@ def scan_directory(
             continue
 
         file_hash = hash_file(path)
+
+        # size/mtime can drift across remounts on FAT/exFAT cards even though
+        # the file itself hasn't changed (timestamp precision isn't reliably
+        # preserved). When the content hash still matches, trust the known-good
+        # tags already in the DB instead of re-reading them from a card that
+        # may not have fully settled right after being plugged in -- a failed
+        # or partial read there would otherwise permanently overwrite good tags
+        # with blanks.
+        if existing and existing.hash == file_hash:
+            existing.size = stat.st_size
+            existing.mtime = stat.st_mtime
+            db.upsert_track(existing)
+            scanned.append(existing)
+            if progress_callback:
+                progress_callback(index, total, path)
+            continue
+
         tag_values = tagsmod.read_tags(path)
 
         track = Track(
