@@ -234,10 +234,12 @@ class MainWindow(QMainWindow):
         conversion_bar = self._build_conversion_bar()
         cover_resize_bar = self._build_cover_resize_bar()
         profile_bar = self._build_profile_bar()
+        force_bar = self._build_force_bar()
 
         layout.addLayout(profile_bar)
         layout.addLayout(conversion_bar)
         layout.addLayout(cover_resize_bar)
+        layout.addLayout(force_bar)
 
     def _build_profile_bar(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -370,6 +372,17 @@ class MainWindow(QMainWindow):
         self.cover_dpi_edit.setValidator(QIntValidator(1, 2400, self))
         self.cover_dpi_edit.setMaximumWidth(70)
         row.addWidget(self.cover_dpi_edit)
+
+        row.addStretch()
+        return row
+
+    def _build_force_bar(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addStretch()
+
+        self.force_checkbox = QCheckBox(tr("chk_force_sync"))
+        self.force_checkbox.setToolTip(tr("chk_force_sync_tooltip"))
+        row.addWidget(self.force_checkbox)
 
         row.addStretch()
         return row
@@ -1030,6 +1043,7 @@ class MainWindow(QMainWindow):
             track_no_fix=self.settings.track_no_fix,
             on_scan_progress=on_scan_progress,
             on_transfer_progress=on_transfer_progress,
+            force=self.force_checkbox.isChecked(),
         )
         progress.close()
 

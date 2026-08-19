@@ -178,6 +178,12 @@ TRANSLATIONS = {
         ),
         "msg_cover_resize_invalid_title": "Invalid cover size",
         "msg_cover_resize_invalid_text": "Enter a cover size and DPI, or uncheck \"Resize cover art\".",
+        "chk_force_sync": "Force re-sync",
+        "chk_force_sync_tooltip": (
+            "When enabled, tracks are re-copied/re-converted/re-processed even if the device already has them "
+            "with a matching hash. Use this after changing conversion or cover resize settings so the new "
+            "settings apply to tracks that were already synced. Existing files are overwritten without asking."
+        ),
         "label_profile": "Profile:",
         "btn_add_profile": "Add profile",
         "btn_delete_profile": "Delete profile",
@@ -216,6 +222,7 @@ TRANSLATIONS = {
         "log_sync_copied": "Copied [{index}/{total}]: {source} -> {target}",
         "log_sync_copy_error": "Error copying {path}: {error}",
         "log_sync_done": "Sync finished: copied={copied}, skipped={skipped}, already_present={present}, errors={errors}",
+        "log_sync_stray_temp_cleanup_failed": "Failed to remove leftover temp file {path}",
         "log_deleted_from_device": "Deleted from device: {path}",
     },
     "pl": {
@@ -397,6 +404,13 @@ TRANSLATIONS = {
         ),
         "msg_cover_resize_invalid_title": "Nieprawidłowy rozmiar okładki",
         "msg_cover_resize_invalid_text": "Wpisz rozmiar okładki i DPI, albo odznacz „Resize okładki”.",
+        "chk_force_sync": "Wymuś resync",
+        "chk_force_sync_tooltip": (
+            "Gdy włączone, utwory są kopiowane/konwertowane/przetwarzane od nowa, nawet jeśli na urządzeniu "
+            "już są z pasującym hashem. Przydatne po zmianie ustawień konwersji lub resize okładki, żeby nowe "
+            "ustawienia zastosowały się też do już zsynchronizowanych utworów. Istniejące pliki są nadpisywane "
+            "bez pytania."
+        ),
         "label_profile": "Profil:",
         "btn_add_profile": "Dodaj profil",
         "btn_delete_profile": "Usuń profil",
@@ -435,6 +449,7 @@ TRANSLATIONS = {
         "log_sync_copied": "Skopiowano [{index}/{total}]: {source} -> {target}",
         "log_sync_copy_error": "Blad kopiowania {path}: {error}",
         "log_sync_done": "Synchronizacja zakonczona: skopiowano={copied}, pominieto={skipped}, juz_obecne={present}, bledy={errors}",
+        "log_sync_stray_temp_cleanup_failed": "Nie udalo sie usunac pozostawionego pliku tymczasowego {path}",
         "log_deleted_from_device": "Usunieto z urzadzenia: {path}",
     },
 }

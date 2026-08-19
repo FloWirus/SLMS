@@ -2,6 +2,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from . import tags as tagsmod
 from .converter import ConversionSettings, CoverResizeSettings, convert_file, decide_conversion
+from .cover_cache import CoverCache, covers_db_path, hash_cover
 from .cover_utils import resize_cover_bytes
 from .db import MusicDatabase, Track, device_db_path
 from .i18n import tr
@@ -48,6 +50,11 @@ TransferProgressCallback = Callable[[int, int, Track, bool, int | None, int | No
 
 COPY_CHUNK_SIZE = 256 * 1024
 COPY_FSYNC_INTERVAL = 0.15
+# Suffix for the in-progress file written on the target before it's renamed to
+# its real name. Deliberately not an audio extension so a leftover one (e.g.
+# after a crash or pulled card) is invisible to scan_directory/iter_audio_files
+# and never mistaken for a real track.
+TARGET_TEMP_SUFFIX = ".musicsync-tmp"
 
 
 def _fsync_path(path: Path) -> None:
@@ -56,6 +63,45 @@ def _fsync_path(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _fsync_dir(path: Path) -> None:
+    # Best-effort: makes the rename below durable against a crash/power loss
+    # right after it happens. Not supported everywhere (e.g. some FAT/exFAT
+    # drivers, Windows) so failures here are not fatal -- the rename itself
+    # already lands atomically, this only affects worst-case crash recovery.
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _write_to_target_atomically(
+    source: Path, target: Path, on_chunk: Callable[[int, int], None] | None
+) -> None:
+    # Never write partial data at the real destination path: stage it under a
+    # temp name in the same directory (so the rename is a same-filesystem,
+    # atomic operation) and only rename it into place once fully written and
+    # fsynced. A crash/pulled card mid-write leaves only the temp file behind,
+    # never a half-written file at `target` that could be mistaken for good.
+    tmp_target = target.with_name(target.name + TARGET_TEMP_SUFFIX)
+    if tmp_target.exists():
+        tmp_target.unlink()
+    _copy_file_with_progress(source, tmp_target, on_chunk)
+    os.replace(tmp_target, target)
+    _fsync_dir(target.parent)
+
+
+def _cleanup_stray_temp_files(root: Path) -> None:
+    for stray in root.rglob(f"*{TARGET_TEMP_SUFFIX}"):
+        try:
+            stray.unlink()
+        except OSError:
+            logger.warning(tr("log_sync_stray_temp_cleanup_failed", path=stray))
 
 
 def _copy_file_with_progress(source: Path, target: Path, on_chunk: Callable[[int, int], None] | None) -> None:
@@ -105,6 +151,7 @@ def sync_to_device(
     track_no_fix: bool = False,
     on_scan_progress: ScanProgressCallback | None = None,
     on_transfer_progress: TransferProgressCallback | None = None,
+    force: bool = False,
 ) -> SyncResult:
     device_mountpoint = Path(device_mountpoint)
     device_db = MusicDatabase(device_db_path(device_mountpoint))
@@ -122,6 +169,7 @@ def sync_to_device(
         track_no_fix,
         on_scan_progress,
         on_transfer_progress,
+        force,
     )
     device_db.close()
     return result
@@ -167,6 +215,7 @@ def _copy_tracks(
     track_no_fix: bool = False,
     on_scan_progress: ScanProgressCallback | None = None,
     on_transfer_progress: TransferProgressCallback | None = None,
+    force: bool = False,
 ) -> SyncResult:
     source_root = Path(source_root)
     target_root = Path(target_root)
@@ -180,15 +229,22 @@ def _copy_tracks(
     # (usually smaller) list of tracks being synced — without this callback
     # the GUI would sit unresponsive for however long this scan takes.
     scan_directory(target_root, target_db, progress_callback=on_scan_progress)
+    _cleanup_stray_temp_files(target_root)
 
     target_source_hashes = target_db.source_hashes()
+
+    # Only relevant for PC -> device syncs (sync_from_device never passes
+    # cover_resize): resized cover output doesn't depend on the target, so
+    # the cache lives next to the PC library, keyed by source cover hash,
+    # and is shared across tracks/albums/repeat syncs/devices.
+    cover_cache = CoverCache(source_root, covers_db_path(source_root)) if cover_resize is not None else None
 
     total = len(tracks)
     for index, track in enumerate(tracks, start=1):
         if on_progress:
             on_progress(index, total, track)
 
-        if track.hash in target_source_hashes:
+        if not force and track.hash in target_source_hashes:
             existing_entry = target_db.get_by_source_hash(track.hash)
             existing_path = target_root / existing_entry.path if existing_entry else None
             if existing_entry and existing_path.exists() and existing_path.stat().st_size > 0:
@@ -210,7 +266,7 @@ def _copy_tracks(
             rel_target = str(Path(rel_target).with_suffix(f".{spec.extension}"))
         target_path = target_root / rel_target
 
-        if target_path.exists():
+        if target_path.exists() and not force:
             existing_entry = target_db.get_by_path(rel_target)
             if existing_entry and existing_entry.source_hash == track.hash:
                 target_source_hashes.add(track.hash)
@@ -222,29 +278,52 @@ def _copy_tracks(
                 result.skipped += 1
                 continue
 
-        if on_transfer_progress:
-            on_transfer_progress(index, total, track, spec is not None, None, None)
+        needs_staging = spec is not None or cover_resize is not None or track_no_fix
+
+        if on_transfer_progress and spec is not None:
+            on_transfer_progress(index, total, track, True, None, None)
+
+        def _on_chunk(copied: int, total_bytes: int) -> None:
+            on_transfer_progress(index, total, track, False, copied, total_bytes)
 
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            if spec is not None:
-                convert_file(source_path, target_path, spec, conversion.use_libsoxr)
-                _fsync_path(target_path)
-                file_format = spec.extension
+
+            if needs_staging:
+                # Do all mutation (convert / resize cover / fix track number) on a
+                # temp file on local disk first -- these steps read-modify-write
+                # the file repeatedly, and the device (SD card / MTP mount) has
+                # much higher access latency than local SSD. Only the finished,
+                # ready-to-go file is written to the device, in one streamed pass.
+                with tempfile.TemporaryDirectory(prefix="music_sync_") as tmp_dir_name:
+                    file_format = spec.extension if spec is not None else track.format
+                    local_path = Path(tmp_dir_name) / f"staged.{file_format}"
+
+                    if spec is not None:
+                        convert_file(source_path, local_path, spec, conversion.use_libsoxr)
+                    else:
+                        shutil.copy2(source_path, local_path)
+
+                    cover_changed = (
+                        _resize_target_cover(local_path, cover_resize, cover_cache, source_path.parent)
+                        if cover_resize is not None
+                        else False
+                    )
+                    track_no_fixed = _fix_target_track_number(local_path) if track_no_fix else False
+                    file_hash = (
+                        hash_file(local_path) if (spec is not None or cover_changed or track_no_fixed) else track.hash
+                    )
+
+                    if on_transfer_progress:
+                        on_transfer_progress(index, total, track, False, None, None)
+                    _write_to_target_atomically(local_path, target_path, _on_chunk if on_transfer_progress else None)
             else:
-                def _on_chunk(copied: int, total_bytes: int) -> None:
-                    on_transfer_progress(index, total, track, False, copied, total_bytes)
-
-                _copy_file_with_progress(source_path, target_path, _on_chunk if on_transfer_progress else None)
+                if on_transfer_progress:
+                    on_transfer_progress(index, total, track, False, None, None)
+                _write_to_target_atomically(source_path, target_path, _on_chunk if on_transfer_progress else None)
                 file_format = track.format
+                file_hash = track.hash
 
-            cover_changed = _resize_target_cover(target_path, cover_resize) if cover_resize is not None else False
-            track_no_fixed = _fix_target_track_number(target_path) if track_no_fix else False
-            if cover_changed or track_no_fixed:
-                _fsync_path(target_path)
-            file_hash = (
-                hash_file(target_path) if (spec is not None or cover_changed or track_no_fixed) else track.hash
-            )
             target_stat = target_path.stat()
 
             _register_track(
@@ -256,6 +335,9 @@ def _copy_tracks(
         except (OSError, subprocess.CalledProcessError) as exc:
             logger.error(tr("log_sync_copy_error", path=track.path, error=exc))
             result.errors.append(f"{track.path}: {exc}")
+
+    if cover_cache is not None:
+        cover_cache.close()
 
     logger.info(
         tr(
@@ -269,13 +351,31 @@ def _copy_tracks(
     return result
 
 
-def _resize_target_cover(target_path: Path, cover_resize: CoverResizeSettings) -> bool:
+def _resize_target_cover(
+    target_path: Path,
+    cover_resize: CoverResizeSettings,
+    cover_cache: CoverCache | None,
+    album_dir: Path,
+) -> bool:
     try:
         cover_bytes = tagsmod.read_cover_art(target_path)
         if not cover_bytes:
             return False
         mime = tagsmod.sniff_image_mime(cover_bytes)
-        resized_bytes = resize_cover_bytes(cover_bytes, mime, cover_resize.max_size, cover_resize.dpi)
+
+        cached = None
+        source_hash = None
+        if cover_cache is not None:
+            source_hash = hash_cover(cover_bytes)
+            cached = cover_cache.get(source_hash, cover_resize.max_size, cover_resize.dpi)
+
+        if cached is not None:
+            resized_bytes, mime = cached
+        else:
+            resized_bytes = resize_cover_bytes(cover_bytes, mime, cover_resize.max_size, cover_resize.dpi)
+            if cover_cache is not None:
+                cover_cache.put(source_hash, cover_resize.max_size, cover_resize.dpi, mime, resized_bytes, album_dir)
+
         tagsmod.write_cover_art(target_path, resized_bytes, mime)
         return True
     except Exception:
