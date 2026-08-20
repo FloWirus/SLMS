@@ -56,13 +56,22 @@ _POLISH_LETTER_RANK = {
 }
 
 
-def polish_sort_key(value: str):
+def polish_sort_key(value: str) -> str:
     """Sort key placing Polish diacritic letters right after their base letter
     (a, \u0105, b, c, \u0107, ... l, \u0142, m, ... z, \u017a, \u017c) instead
-    of after z. Each character contributes one rank, so words compare
-    correctly position by position regardless of length."""
+    of after z.
+
+    Returns a string, not the tuple-of-ranks this used to be: each rank is
+    encoded as a fixed-width, zero-padded digit block, so comparing the
+    strings lexicographically gives exactly the same order comparing the
+    tuples position-by-position would. That matters because this key also
+    feeds Qt.UserRole for table sorting (see TrackTableModel.data below) --
+    QSortFilterProxyModel's default lessThan compares QVariants via a
+    registered "<" operator, which plain Python tuples don't have, so a
+    tuple key silently sorts as a no-op there even though sorted(key=...)
+    (used elsewhere in this file) is perfectly happy with one."""
     lowered = value.lower()
-    return tuple(_POLISH_LETTER_RANK.get(ch, ord(ch)) for ch in lowered)
+    return "".join(f"{round(_POLISH_LETTER_RANK.get(ch, ord(ch)) * 10):08d}" for ch in lowered)
 
 
 def format_size(num_bytes: int) -> str:
@@ -72,6 +81,24 @@ def format_size(num_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+# Columns whose display text ("10", "9", "9.5 MB") sorts wrong as a string;
+# these are compared as numbers instead, via _numeric_sort_key below.
+_NUMERIC_COLUMNS = {"track_number", "track_total", "disc_number", "year", "size"}
+
+
+def _numeric_sort_key(value) -> float:
+    """The value as a float for anything that parses as a number, or +inf for
+    blank/non-numeric values so they consistently sort after every real
+    number instead of interleaving among them the way string comparison
+    would. A single float rather than a (flag, value) tuple for the same
+    reason polish_sort_key returns a string now: Qt.UserRole sorting goes
+    through QVariant comparison, which doesn't know how to compare tuples."""
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return float("inf")
 
 
 class TrackTableModel(QAbstractTableModel):
@@ -149,11 +176,15 @@ class TrackTableModel(QAbstractTableModel):
         if key == "checked":
             if role == Qt.DecorationRole:
                 return checkbox_icon(track.hash in self._checked_hashes)
+            if role == Qt.UserRole:
+                return track.hash in self._checked_hashes
             return None
 
         if key == "on_device":
             if role == Qt.DecorationRole and track.source_hash in self._device_hashes:
                 return full_presence_icon()
+            if role == Qt.UserRole:
+                return track.source_hash in self._device_hashes
             return None
 
         if role == Qt.DisplayRole:
@@ -164,27 +195,12 @@ class TrackTableModel(QAbstractTableModel):
             return getattr(track, key)
 
         if role == Qt.UserRole:
-            return getattr(track, key)
+            # The proxy view sorts on this role (see MainWindow._build_table_view,
+            # which sets setSortRole(Qt.UserRole)) instead of the formatted
+            # DisplayRole text above, so numbers and Polish-alphabet text
+            # compare correctly instead of as plain strings.
+            if key in _NUMERIC_COLUMNS:
+                return _numeric_sort_key(getattr(track, key))
+            return polish_sort_key(str(getattr(track, key) or ""))
 
         return None
-
-    def sort(self, column: int, order=Qt.AscendingOrder) -> None:
-        key, _ = COLUMN_KEYS[column]
-        reverse = order == Qt.DescendingOrder
-        self.layoutAboutToBeChanged.emit()
-
-        def sort_key(track: Track):
-            if key == "checked":
-                return track.hash in self._checked_hashes
-            if key == "on_device":
-                return track.source_hash in self._device_hashes
-            value = getattr(track, key)
-            if key in ("track_number", "track_total", "disc_number", "year", "size"):
-                try:
-                    return (0, float(value))
-                except (ValueError, TypeError):
-                    return (1, 0.0)
-            return polish_sort_key(str(value))
-
-        self._tracks.sort(key=sort_key, reverse=reverse)
-        self.layoutChanged.emit()

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -89,20 +91,19 @@ class SettingsDialog(QDialog):
         self.accept()
 
     def updated_settings(self) -> Settings:
-        return Settings(
+        # replace() copies every other field from self._settings untouched
+        # (last_source_root, profiles, header states, ...) instead of listing
+        # them all out here -- a field this dialog doesn't have a widget for
+        # can no longer be silently reset to its dataclass default just
+        # because whoever added it forgot to thread it through this method.
+        return replace(
+            self._settings,
             dir_template=self.dir_template_edit.text().strip(),
             filename_template=self.filename_template_edit.text().strip(),
-            last_source_root=self._settings.last_source_root,
             language=self.language_combo.currentData(),
             theme=self.theme_combo.currentData(),
             use_libsoxr=self.libsoxr_checkbox.isChecked(),
             track_no_fix=self.track_no_fix_checkbox.isChecked(),
-            profiles=self._settings.profiles,
-            last_profile_name=self._settings.last_profile_name,
-            table_header_state=self._settings.table_header_state,
-            device_table_header_state=self._settings.device_table_header_state,
-            tree_header_state=self._settings.tree_header_state,
-            device_tree_header_state=self._settings.device_tree_header_state,
         )
 
 

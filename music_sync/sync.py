@@ -10,9 +10,11 @@ from enum import Enum, auto
 from pathlib import Path
 
 from . import tags as tagsmod
+from .album_covers import read_loose_cover
+from .constants import AUDIO_EXTENSIONS
 from .converter import ConversionSettings, CoverResizeSettings, convert_file, decide_conversion
 from .cover_cache import CoverCache, covers_db_path, hash_cover
-from .cover_utils import resize_cover_bytes
+from .cover_utils import read_image_info, resize_cover_bytes
 from .db import MusicDatabase, Track, device_db_path
 from .i18n import tr
 from .scanner import hash_file, scan_directory
@@ -32,6 +34,7 @@ class SyncResult:
     skipped: int = 0
     already_present: int = 0
     errors: list[str] | None = None
+    cancelled: bool = False
 
     def __post_init__(self):
         if self.errors is None:
@@ -41,12 +44,8 @@ class SyncResult:
 ConflictCallback = Callable[[Track, Path], ConflictResolution]
 ProgressCallback = Callable[[int, int, Track], None]
 ScanProgressCallback = Callable[[int, int, Path], None]
-# index, total tracks, track, converting, bytes_copied, total_bytes.
-# For a converted file this fires once with converting=True and the byte
-# fields left None (conversion runs as one blocking ffmpeg call, no byte-level
-# progress available). For a plain copy it fires once at the start the same
-# way, then repeatedly as bytes are copied with converting=False and real figures.
-TransferProgressCallback = Callable[[int, int, Track, bool, int | None, int | None], None]
+ShouldStopCallback = Callable[[], bool]
+DeleteProgressCallback = Callable[[int, int, Track], None]
 
 COPY_CHUNK_SIZE = 256 * 1024
 COPY_FSYNC_INTERVAL = 0.15
@@ -55,14 +54,6 @@ COPY_FSYNC_INTERVAL = 0.15
 # after a crash or pulled card) is invisible to scan_directory/iter_audio_files
 # and never mistaken for a real track.
 TARGET_TEMP_SUFFIX = ".musicsync-tmp"
-
-
-def _fsync_path(path: Path) -> None:
-    fd = os.open(str(path), os.O_RDWR if os.name != "nt" else os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -80,9 +71,7 @@ def _fsync_dir(path: Path) -> None:
         pass
 
 
-def _write_to_target_atomically(
-    source: Path, target: Path, on_chunk: Callable[[int, int], None] | None
-) -> None:
+def _write_to_target_atomically(source: Path, target: Path) -> None:
     # Never write partial data at the real destination path: stage it under a
     # temp name in the same directory (so the rename is a same-filesystem,
     # atomic operation) and only rename it into place once fully written and
@@ -91,7 +80,7 @@ def _write_to_target_atomically(
     tmp_target = target.with_name(target.name + TARGET_TEMP_SUFFIX)
     if tmp_target.exists():
         tmp_target.unlink()
-    _copy_file_with_progress(source, tmp_target, on_chunk)
+    _copy_file_durably(source, tmp_target)
     os.replace(tmp_target, target)
     _fsync_dir(target.parent)
 
@@ -104,13 +93,15 @@ def _cleanup_stray_temp_files(root: Path) -> None:
             logger.warning(tr("log_sync_stray_temp_cleanup_failed", path=stray))
 
 
-def _copy_file_with_progress(source: Path, target: Path, on_chunk: Callable[[int, int], None] | None) -> None:
+def _copy_file_durably(source: Path, target: Path) -> None:
+    """Copy source to target in chunks, periodically flushing and fsyncing
+    what has been written so far out of the OS page cache and onto the
+    device. There is no per-file progress UI for this (deliberately -- one
+    progress bar for the whole sync is enough), but the durability behaviour
+    below is unconditional: it is what limits how much data could be lost if
+    a card is pulled mid-copy, and must run on every copy regardless of
+    whether anything is watching progress."""
     total = source.stat().st_size
-    if on_chunk is None or total == 0:
-        shutil.copy2(source, target)
-        _fsync_path(target)
-        return
-
     copied = 0
     last_fsync_time = time.monotonic()
     with open(source, "rb") as src, open(target, "wb") as dst:
@@ -122,19 +113,9 @@ def _copy_file_with_progress(source: Path, target: Path, on_chunk: Callable[[int
             copied += len(chunk)
             now = time.monotonic()
             if now - last_fsync_time >= COPY_FSYNC_INTERVAL or copied == total:
-                # Periodically force these bytes out of the OS page cache and
-                # onto the device as we go, rather than leaving it all
-                # buffered until the file is closed -- limits how much data
-                # could be lost if the card is pulled mid-copy. Throttled by
-                # time since it's a slow, blocking syscall on removable
-                # media -- kept separate from the on_chunk() progress report
-                # below, which fires every chunk so the UI shows real,
-                # granular progress even for small files that finish in a
-                # single fsync interval.
                 dst.flush()
                 os.fsync(dst.fileno())
                 last_fsync_time = now
-            on_chunk(copied, total)
     shutil.copystat(source, target)
 
 
@@ -150,8 +131,8 @@ def sync_to_device(
     cover_resize: CoverResizeSettings | None = None,
     track_no_fix: bool = False,
     on_scan_progress: ScanProgressCallback | None = None,
-    on_transfer_progress: TransferProgressCallback | None = None,
     force: bool = False,
+    should_stop: ShouldStopCallback | None = None,
 ) -> SyncResult:
     device_mountpoint = Path(device_mountpoint)
     device_db = MusicDatabase(device_db_path(device_mountpoint))
@@ -168,8 +149,8 @@ def sync_to_device(
         cover_resize,
         track_no_fix,
         on_scan_progress,
-        on_transfer_progress,
         force,
+        should_stop,
     )
     device_db.close()
     return result
@@ -185,7 +166,7 @@ def sync_from_device(
     on_conflict: ConflictCallback,
     on_progress: ProgressCallback | None = None,
     on_scan_progress: ScanProgressCallback | None = None,
-    on_transfer_progress: TransferProgressCallback | None = None,
+    should_stop: ShouldStopCallback | None = None,
 ) -> SyncResult:
     return _copy_tracks(
         device_mountpoint,
@@ -197,7 +178,7 @@ def sync_from_device(
         on_conflict,
         on_progress,
         on_scan_progress=on_scan_progress,
-        on_transfer_progress=on_transfer_progress,
+        should_stop=should_stop,
     )
 
 
@@ -214,8 +195,8 @@ def _copy_tracks(
     cover_resize: CoverResizeSettings | None = None,
     track_no_fix: bool = False,
     on_scan_progress: ScanProgressCallback | None = None,
-    on_transfer_progress: TransferProgressCallback | None = None,
     force: bool = False,
+    should_stop: ShouldStopCallback | None = None,
 ) -> SyncResult:
     source_root = Path(source_root)
     target_root = Path(target_root)
@@ -228,7 +209,10 @@ def _copy_tracks(
     # separately from on_progress since this scans the whole target, not the
     # (usually smaller) list of tracks being synced — without this callback
     # the GUI would sit unresponsive for however long this scan takes.
-    scan_directory(target_root, target_db, progress_callback=on_scan_progress)
+    scan_directory(target_root, target_db, progress_callback=on_scan_progress, should_stop=should_stop)
+    if should_stop and should_stop():
+        result.cancelled = True
+        return result
     _cleanup_stray_temp_files(target_root)
 
     target_source_hashes = target_db.source_hashes()
@@ -238,9 +222,18 @@ def _copy_tracks(
     # the cache lives next to the PC library, keyed by source cover hash,
     # and is shared across tracks/albums/repeat syncs/devices.
     cover_cache = CoverCache(source_root, covers_db_path(source_root)) if cover_resize is not None else None
+    # Which cover to resize from is picked per album (best quality found
+    # across all of the album's tracks' own tags plus any loose [Covers]
+    # file), not just the one track currently being written -- cache that
+    # choice so it's only computed once per album instead of once per track.
+    best_album_cover = _LastAlbumCoverCache()
 
     total = len(tracks)
     for index, track in enumerate(tracks, start=1):
+        if should_stop and should_stop():
+            result.cancelled = True
+            break
+
         if on_progress:
             on_progress(index, total, track)
 
@@ -280,12 +273,6 @@ def _copy_tracks(
 
         needs_staging = spec is not None or cover_resize is not None or track_no_fix
 
-        if on_transfer_progress and spec is not None:
-            on_transfer_progress(index, total, track, True, None, None)
-
-        def _on_chunk(copied: int, total_bytes: int) -> None:
-            on_transfer_progress(index, total, track, False, copied, total_bytes)
-
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -305,7 +292,7 @@ def _copy_tracks(
                         shutil.copy2(source_path, local_path)
 
                     cover_changed = (
-                        _resize_target_cover(local_path, cover_resize, cover_cache, source_path.parent)
+                        _resize_target_cover(local_path, cover_resize, cover_cache, source_path.parent, best_album_cover)
                         if cover_resize is not None
                         else False
                     )
@@ -314,13 +301,9 @@ def _copy_tracks(
                         hash_file(local_path) if (spec is not None or cover_changed or track_no_fixed) else track.hash
                     )
 
-                    if on_transfer_progress:
-                        on_transfer_progress(index, total, track, False, None, None)
-                    _write_to_target_atomically(local_path, target_path, _on_chunk if on_transfer_progress else None)
+                    _write_to_target_atomically(local_path, target_path)
             else:
-                if on_transfer_progress:
-                    on_transfer_progress(index, total, track, False, None, None)
-                _write_to_target_atomically(source_path, target_path, _on_chunk if on_transfer_progress else None)
+                _write_to_target_atomically(source_path, target_path)
                 file_format = track.format
                 file_hash = track.hash
 
@@ -351,17 +334,91 @@ def _copy_tracks(
     return result
 
 
+def _album_cover_quality(data: bytes) -> tuple[int, int] | None:
+    info = read_image_info(data)
+    if info is None:
+        return None
+    width, height, dpi = info
+    return (width * height, dpi)
+
+
+def _find_best_album_cover(album_dir: Path) -> tuple[bytes, str] | None:
+    """Pick the highest-quality cover available for an album: the loose cover
+    file sitting in `album_dir` (cover.jpg, folder.png, ...) plus the
+    embedded art of every track there, compared by pixel count (then dpi as
+    a tiebreaker). Resizing always starts from this one, regardless of which
+    track is currently being written, so a track with a poor/missing
+    embedded cover still ends up with the album's best artwork.
+
+    The loose file is read in place and comes first, so on equal quality the
+    file the user put in the directory is the one that wins."""
+    candidates: list[tuple[bytes, str]] = []
+
+    loose = read_loose_cover(album_dir)
+    if loose is not None:
+        candidates.append(loose)
+
+    try:
+        album_entries = list(album_dir.iterdir())
+    except OSError:
+        album_entries = []
+    for audio_path in album_entries:
+        if not audio_path.is_file() or audio_path.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        cover_bytes = tagsmod.read_cover_art(audio_path)
+        if cover_bytes:
+            candidates.append((cover_bytes, tagsmod.sniff_image_mime(cover_bytes)))
+
+    best: tuple[bytes, str] | None = None
+    best_quality: tuple[int, int] | None = None
+    for data, mime in candidates:
+        quality = _album_cover_quality(data)
+        if quality is None:
+            continue
+        if best_quality is None or quality > best_quality:
+            best_quality = quality
+            best = (data, mime)
+    return best
+
+
+class _LastAlbumCoverCache:
+    """Caches the best available source cover for only the most recently
+    seen album directory, not every album touched during the sync.
+
+    Tracks arrive grouped by album (all_tracks() is sorted by artist, then
+    album), so in practice this is a single-slot cache with a 100% hit rate.
+    A dict keyed by every album dir instead -- as this used to be -- would
+    hold every album's *raw, undownscaled* cover bytes in memory for the
+    whole sync and never release them: a library of a few hundred albums at
+    a few MB of embedded art each adds up to real memory. If tracks were
+    ever handed over in some other order, a cache miss just means
+    recomputing that album's best cover -- never a wrong one."""
+
+    def __init__(self) -> None:
+        self._album_dir: Path | None = None
+        self._best: tuple[bytes, str] | None = None
+        self._loaded = False
+
+    def get(self, album_dir: Path) -> tuple[bytes, str] | None:
+        if not self._loaded or album_dir != self._album_dir:
+            self._album_dir = album_dir
+            self._best = _find_best_album_cover(album_dir)
+            self._loaded = True
+        return self._best
+
+
 def _resize_target_cover(
     target_path: Path,
     cover_resize: CoverResizeSettings,
     cover_cache: CoverCache | None,
     album_dir: Path,
+    best_album_cover: _LastAlbumCoverCache,
 ) -> bool:
     try:
-        cover_bytes = tagsmod.read_cover_art(target_path)
-        if not cover_bytes:
+        best = best_album_cover.get(album_dir)
+        if best is None:
             return False
-        mime = tagsmod.sniff_image_mime(cover_bytes)
+        cover_bytes, mime = best
 
         cached = None
         source_hash = None
@@ -436,13 +493,31 @@ def remove_empty_parent_dirs(start_dir: Path, root: Path) -> None:
         current = current.parent
 
 
-def delete_from_device(device_mountpoint: Path, device_track: Track) -> None:
+def delete_many_from_device(
+    device_mountpoint: Path,
+    device_tracks: list[Track],
+    on_progress: DeleteProgressCallback | None = None,
+) -> None:
+    """Delete the given tracks from the device and drop their rows from its
+    database. The database is opened once and committed once for the whole
+    batch -- doing that per track meant an open/commit/close cycle (each a
+    real flush) against removable media for every single file."""
     device_mountpoint = Path(device_mountpoint)
-    file_path = device_mountpoint / device_track.path
-    if file_path.exists():
-        file_path.unlink()
-        remove_empty_parent_dirs(file_path.parent, device_mountpoint)
+    if not device_tracks:
+        return
+
     device_db = MusicDatabase(device_db_path(device_mountpoint))
-    device_db.delete_by_path(device_track.path)
-    device_db.close()
-    logger.info(tr("log_deleted_from_device", path=device_track.path))
+    try:
+        with device_db.batch():
+            total = len(device_tracks)
+            for index, device_track in enumerate(device_tracks, start=1):
+                if on_progress:
+                    on_progress(index, total, device_track)
+                file_path = device_mountpoint / device_track.path
+                if file_path.exists():
+                    file_path.unlink()
+                    remove_empty_parent_dirs(file_path.parent, device_mountpoint)
+                device_db.delete_by_path(device_track.path)
+                logger.info(tr("log_deleted_from_device", path=device_track.path))
+    finally:
+        device_db.close()

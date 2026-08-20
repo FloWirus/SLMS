@@ -1,7 +1,8 @@
 import ctypes
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from .constants import DB_DIRNAME, DEVICE_DB_DIRNAME, LIBRARY_DB_FILENAME, DEVICE_DB_FILENAME
@@ -82,7 +83,31 @@ class MusicDatabase:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._deferred_commits = 0
         self._migrate()
+
+    @contextmanager
+    def batch(self):
+        """Group many writes into a single transaction: the individual write
+        methods below skip their own commit while this is active, and one
+        commit happens on exit. Committing per row is what makes bulk work
+        (a full scan, deleting a whole album) slow, especially on removable
+        media where every commit means a real flush to the card.
+
+        Partial work is still committed if the body raises or breaks out
+        early, matching the per-row behaviour it replaces -- a scan that
+        errors halfway keeps the rows it already processed."""
+        self._deferred_commits += 1
+        try:
+            yield
+        finally:
+            self._deferred_commits -= 1
+            if not self._deferred_commits:
+                self.conn.commit()
+
+    def _commit(self) -> None:
+        if not self._deferred_commits:
+            self.conn.commit()
 
     def _migrate(self):
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(tracks)")}
@@ -123,23 +148,36 @@ class MusicDatabase:
                 format=excluded.format,
                 size=excluded.size,
                 mtime=excluded.mtime
+            RETURNING id
             """,
             track.__dict__,
         )
-        self.conn.commit()
-        row = self.conn.execute("SELECT id FROM tracks WHERE path = ?", (track.path,)).fetchone()
+        row = cur.fetchone()
+        self._commit()
         return row["id"]
 
     def delete_by_path(self, path: str):
         self.conn.execute("DELETE FROM tracks WHERE path = ?", (path,))
-        self.conn.commit()
+        self._commit()
 
     def remove_missing(self, existing_paths: set[str]):
-        rows = self.conn.execute("SELECT path FROM tracks").fetchall()
-        for row in rows:
-            if row["path"] not in existing_paths:
-                self.conn.execute("DELETE FROM tracks WHERE path = ?", (row["path"],))
-        self.conn.commit()
+        # Staged through a temp table rather than a "path NOT IN (...)" with
+        # one parameter per path -- large libraries would blow past SQLite's
+        # bound-parameter limit, and this stays a single DELETE either way.
+        self.conn.execute("CREATE TEMP TABLE IF NOT EXISTS existing_paths (path TEXT PRIMARY KEY)")
+        self.conn.execute("DELETE FROM existing_paths")
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO existing_paths (path) VALUES (?)", ((p,) for p in existing_paths)
+        )
+        self.conn.execute("DELETE FROM tracks WHERE path NOT IN (SELECT path FROM existing_paths)")
+        self.conn.execute("DELETE FROM existing_paths")
+        self._commit()
+
+    def tracks_by_path(self) -> dict[str, Track]:
+        """Every row keyed by its relative path, for callers that would
+        otherwise run one get_by_path() query per file on disk."""
+        rows = self.conn.execute("SELECT * FROM tracks").fetchall()
+        return {row["path"]: Track.from_row(row) for row in rows}
 
     def all_tracks(self) -> list[Track]:
         rows = self.conn.execute(
@@ -173,7 +211,7 @@ class MusicDatabase:
         set_clause = ", ".join(f"{k} = :{k}" for k in fields)
         fields["id"] = track_id
         self.conn.execute(f"UPDATE tracks SET {set_clause} WHERE id = :id", fields)
-        self.conn.commit()
+        self._commit()
 
 
 def library_db_path(project_root: Path) -> Path:

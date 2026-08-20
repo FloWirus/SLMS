@@ -138,6 +138,11 @@ class AlbumEditDialog(QDialog):
         self.info_label.setText(tr("info_apply_to_all", count=len(tracks)))
         self._load_cover_preview()
 
+        # Snapshot of what was loaded, taken once every widget holds its
+        # value: navigation compares against this to decide whether the
+        # album's files need writing at all.
+        self._loaded_fields = self._current_album_fields()
+
         self.position_label.setText(f"{index + 1} / {len(self.albums)}")
         self.prev_btn.setEnabled(index > 0)
         self.next_btn.setEnabled(index < len(self.albums) - 1)
@@ -175,12 +180,29 @@ class AlbumEditDialog(QDialog):
         )
         self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
 
+    def _current_album_fields(self) -> dict:
+        return {
+            "artist": self.artist_edit.text(),
+            "album": self.album_edit.text(),
+            "track_total": self.track_total_edit.text(),
+            "year": self.year_edit.text(),
+            "genre": self.genre_edit.text(),
+        }
+
+    def _is_dirty(self) -> bool:
+        """Whether the album-wide fields or the cover actually differ from
+        what was loaded."""
+        if self._new_cover_bytes is not None:
+            return True
+        return self._current_album_fields() != self._loaded_fields
+
     def _save_current(self) -> bool:
-        artist = self.artist_edit.text()
-        album = self.album_edit.text()
-        track_total = self.track_total_edit.text()
-        year = self.year_edit.text()
-        genre = self.genre_edit.text()
+        album_fields = self._current_album_fields()
+        artist = album_fields["artist"]
+        album = album_fields["album"]
+        track_total = album_fields["track_total"]
+        year = album_fields["year"]
+        genre = album_fields["genre"]
 
         errors: list[str] = []
         updated_tracks: list[Track] = []
@@ -220,14 +242,18 @@ class AlbumEditDialog(QDialog):
     def _go_previous(self):
         if self.index == 0:
             return
-        if not self._save_current():
+        # Paging between albums must not rewrite them. This dialog writes the
+        # form's values into *every* track of the album, so saving on each
+        # step would rewrite (and rehash) whole albums the user only looked
+        # at. Save still applies them on demand -- that is what it is for.
+        if self._is_dirty() and not self._save_current():
             return
         self._load_index(self.index - 1)
 
     def _go_next(self):
         if self.index == len(self.albums) - 1:
             return
-        if not self._save_current():
+        if self._is_dirty() and not self._save_current():
             return
         self._load_index(self.index + 1)
 

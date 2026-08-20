@@ -2,6 +2,10 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtGui import QImage
 
 METERS_PER_INCH = 0.0254
+# Quality for JPEG output. 90 is visually indistinguishable from 100 at the
+# sizes covers get resized to, at roughly half the bytes -- which matters on
+# a device where the artwork ships inside every single track.
+JPEG_QUALITY = 90
 
 
 def resize_cover_bytes(data: bytes, mime: str, max_size: int, dpi: int) -> bytes:
@@ -27,8 +31,21 @@ def resize_cover_bytes(data: bytes, mime: str, max_size: int, dpi: int) -> bytes
     buffer = QBuffer(byte_array)
     buffer.open(QIODevice.WriteOnly)
     if fmt == "JPEG":
-        image.save(buffer, fmt, quality=90)
+        image.save(buffer, fmt, quality=JPEG_QUALITY)
     else:
         image.save(buffer, fmt)
     buffer.close()
     return bytes(byte_array)
+
+
+def read_image_info(data: bytes) -> tuple[int, int, int] | None:
+    """Return (width, height, dpi) for the given image bytes, or None if the
+    data can't be decoded as an image. dpi is 0 when the image carries no
+    density info."""
+    image = QImage()
+    image.loadFromData(data)
+    if image.isNull():
+        return None
+    dots_per_meter = image.dotsPerMeterX() or image.dotsPerMeterY()
+    dpi = round(dots_per_meter * METERS_PER_INCH) if dots_per_meter else 0
+    return image.width(), image.height(), dpi

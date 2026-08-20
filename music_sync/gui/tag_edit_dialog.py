@@ -20,6 +20,7 @@ from .. import tags as tagsmod
 from ..db import Track
 from ..i18n import tr
 from ..settings import Settings
+from ..templating import sanitize_component
 
 COVER_SIZE = 150
 DIALOG_MIN_SIZE = (650, 520)
@@ -136,6 +137,12 @@ class TagEditDialog(QDialog):
         self.filename_edit.setText(self.file_path.stem)
         self._load_cover_preview()
 
+        # Snapshot of what was loaded, taken once every widget holds its
+        # value: navigation compares against this to decide whether the file
+        # needs writing at all.
+        self._loaded_fields = self._current_fields()
+        self._loaded_stem = self.file_path.stem
+
         self.position_label.setText(f"{index + 1} / {len(self.tracks)}")
         self.prev_btn.setEnabled(index > 0)
         self.next_btn.setEnabled(index < len(self.tracks) - 1)
@@ -184,6 +191,28 @@ class TagEditDialog(QDialog):
             "genre": self.genre_edit.text(),
         }
 
+    def _new_stem(self) -> str | None:
+        """The filename field's value, sanitized the same way template
+        rendering sanitizes path components -- strips characters that are
+        invalid in a filename (including "/" and "\\", so a value like
+        "../evil" can't escape the album directory) and collapses a result
+        that is otherwise empty or only dots/spaces down to "_".
+
+        A blank field is left as None rather than sanitized to "_": clearing
+        the field means "leave the filename alone", not "rename to _"."""
+        raw = self.filename_edit.text().strip()
+        return sanitize_component(raw) if raw else None
+
+    def _is_dirty(self) -> bool:
+        """Whether anything the user can edit here actually differs from what
+        was loaded -- tags, filename or cover."""
+        if self._new_cover_bytes is not None:
+            return True
+        if self._current_fields() != self._loaded_fields:
+            return True
+        new_stem = self._new_stem()
+        return new_stem is not None and new_stem != self._loaded_stem
+
     def _save_current(self) -> bool:
         fields = self._current_fields()
         try:
@@ -191,8 +220,8 @@ class TagEditDialog(QDialog):
             if self._new_cover_bytes is not None:
                 tagsmod.write_cover_art(self.file_path, self._new_cover_bytes, self._new_cover_mime)
 
-            new_stem = self.filename_edit.text().strip()
-            if new_stem and new_stem != self.file_path.stem:
+            new_stem = self._new_stem()
+            if new_stem is not None and new_stem != self.file_path.stem:
                 new_path = self.file_path.with_name(new_stem + self.file_path.suffix)
                 if new_path.exists():
                     raise FileExistsError(tr("error_file_exists", name=new_path.name))
@@ -214,14 +243,17 @@ class TagEditDialog(QDialog):
     def _go_previous(self):
         if self.index == 0:
             return
-        if not self._save_current():
+        # Merely paging through tracks must not rewrite them: an untouched
+        # file keeps its bytes, its mtime and therefore its hash -- which is
+        # what "already on the device" is matched on.
+        if self._is_dirty() and not self._save_current():
             return
         self._load_index(self.index - 1)
 
     def _go_next(self):
         if self.index == len(self.tracks) - 1:
             return
-        if not self._save_current():
+        if self._is_dirty() and not self._save_current():
             return
         self._load_index(self.index + 1)
 

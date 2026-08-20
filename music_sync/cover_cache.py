@@ -25,6 +25,11 @@ class CoverCache:
     -- across tracks in an album, repeat syncs, force-resync, or different
     target devices -- is then a file read instead of a decode+resize.
 
+    `[Covers]/` holds resize output and nothing else. Artwork the user put in
+    an album directory (cover.jpg, folder.png) is a *source*: it is read in
+    place by album_covers.read_loose_cover() and never moved, renamed or
+    deleted.
+
     Lives on the PC library side only: resize output doesn't depend on the
     sync target, and keeping it next to the source files means it survives
     moving the whole library folder.

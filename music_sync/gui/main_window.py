@@ -1,4 +1,5 @@
 import logging
+import shutil
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QObject, Qt, QThread, Signal
@@ -44,11 +45,18 @@ from ..db import MusicDatabase, Track, device_db_path, library_db_path
 from ..i18n import set_language, tr
 from ..scanner import hash_file, scan_directory
 from ..settings import Settings
-from ..sync import ConflictResolution, delete_from_device, remove_empty_parent_dirs, sync_from_device, sync_to_device
+from ..sync import (
+    ConflictResolution,
+    SyncResult,
+    delete_many_from_device,
+    remove_empty_parent_dirs,
+    sync_from_device,
+    sync_to_device,
+)
 from .album_edit_dialog import AlbumEditDialog
 from .icons import full_presence_icon, partial_presence_icon
 from .media_info_dialog import MediaInfoDialog
-from .models import COLUMN_KEYS, TrackTableModel, polish_sort_key
+from .models import COLUMN_KEYS, TrackTableModel, format_size, polish_sort_key
 from .settings_dialog import SettingsDialog
 from .tag_edit_dialog import TagEditDialog
 from .theme import apply_theme
@@ -72,9 +80,7 @@ class _EjectWorker(QObject):
 
 
 class _TransferProgressDialog(QDialog):
-    """Sync progress dialog with two bars: the top one tracks overall
-    progress across all tracks, the bottom one tracks progress through the
-    file currently being copied/converted."""
+    """Sync progress dialog tracking overall progress across all tracks."""
 
     def __init__(self, initial_text: str, cancel_text: str | None, minimum: int, maximum: int, parent=None):
         super().__init__(parent)
@@ -86,10 +92,6 @@ class _TransferProgressDialog(QDialog):
         self._bar.setMinimum(minimum)
         self._bar.setMaximum(maximum)
         layout.addWidget(self._bar)
-        self._file_bar = QProgressBar()
-        self._file_bar.setMinimum(0)
-        self._file_bar.setMaximum(0)
-        layout.addWidget(self._file_bar)
         self._cancelled = False
         if cancel_text:
             button_row = QHBoxLayout()
@@ -113,15 +115,6 @@ class _TransferProgressDialog(QDialog):
 
     def setValue(self, value: int) -> None:
         self._bar.setValue(value)
-
-    def setFileIndeterminate(self, format_text: str = "") -> None:
-        self._file_bar.setRange(0, 0)
-        self._file_bar.setFormat(format_text)
-
-    def setFileProgress(self, value: int, maximum: int) -> None:
-        self._file_bar.setRange(0, maximum)
-        self._file_bar.setValue(value)
-        self._file_bar.setFormat("%p%")
 
 
 APP_NAME = "SLMS"
@@ -222,6 +215,14 @@ class MainWindow(QMainWindow):
             self.device_tree_widget,
             self._toggle_check_all_device,
         )
+        self.device_space_bar = QProgressBar()
+        self.device_space_bar.setMaximum(100)
+        self.device_space_bar.setTextVisible(False)
+        self.device_space_bar.setFixedHeight(8)
+        self.device_space_bar.setVisible(False)
+        device_pane.layout().addWidget(self.device_space_bar)
+        self.device_space_label = QLabel()
+        device_pane.layout().addWidget(self.device_space_label)
         splitter.addWidget(device_pane)
 
         splitter.setStretchFactor(0, 1)
@@ -487,6 +488,11 @@ class MainWindow(QMainWindow):
         model = TrackTableModel(presence_label=presence_label, checked_hashes=checked_hashes, on_check_changed=on_check_changed)
         proxy_model = QSortFilterProxyModel()
         proxy_model.setSourceModel(model)
+        # Sort by the raw value each column's data() returns under
+        # Qt.UserRole (numbers as numbers, text through polish_sort_key)
+        # instead of the proxy's default of comparing the formatted
+        # DisplayRole strings shown in the cells.
+        proxy_model.setSortRole(Qt.UserRole)
         view.setModel(proxy_model)
         view.setSortingEnabled(True)
         view.setColumnWidth(0, 28)
@@ -556,31 +562,6 @@ class MainWindow(QMainWindow):
         self._refresh_views()
         count = len(self.library_db.all_tracks())
         self.status_label.setText(tr("status_loaded_library", count=count, path=self.source_root))
-
-    def _make_transfer_progress_handler(self, progress: "_TransferProgressDialog"):
-        """Builds the on_transfer_progress callback for sync.py: drives the
-        dialog's second (per-file) progress bar -- indeterminate while a
-        transcode is running (ffmpeg gives no byte-level progress), otherwise
-        tracking bytes copied so far for a plain copy."""
-
-        def on_transfer_progress(
-            index: int,
-            total: int,
-            track: Track,
-            converting: bool,
-            bytes_copied: int | None,
-            total_bytes: int | None,
-        ):
-            progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
-            if converting:
-                progress.setFileIndeterminate(tr("progress_converting_label"))
-            elif bytes_copied is not None and total_bytes:
-                progress.setFileProgress(bytes_copied, total_bytes)
-            else:
-                progress.setFileIndeterminate()
-            QApplication.processEvents()
-
-        return on_transfer_progress
 
     def _scan_with_progress(self, root: Path, db: MusicDatabase) -> tuple[list, bool]:
         """Scan root and reconcile db with what's actually on disk (drops
@@ -850,9 +831,19 @@ class MainWindow(QMainWindow):
 
         self.device_combo.setCurrentIndex(restore_index)
         self.device_combo.blockSignals(False)
-        self._on_device_selected(restore_index)
+        # Re-listing the devices says nothing about their contents, so the
+        # already-selected device keeps its scanned state -- only a device
+        # we weren't on before is worth the full (hash-every-file) scan.
+        restored = self.device_combo.itemData(restore_index)
+        same_device = restored is not None and restored.mountpoint == current_mount
+        self._on_device_selected(restore_index, rescan=not same_device)
 
-    def _on_device_selected(self, index: int):
+    def _on_device_selected(self, index: int, rescan: bool = True):
+        """Switch to the device at `index`. `rescan=False` skips the full
+        device scan, for callers that just brought its database up to date
+        themselves (a finished sync, a deletion) -- scanning re-hashes every
+        file on the card, so it must not be the default reaction to any
+        refresh."""
         self.selected_device = self.device_combo.itemData(index)
         if self.device_db:
             self.device_db.close()
@@ -866,11 +857,31 @@ class MainWindow(QMainWindow):
                 )
             )
             self.device_db = MusicDatabase(device_db_path(Path(self.selected_device.mountpoint)))
-            self._scan_device_directory()
+            if rescan:
+                self._scan_device_directory()
             self.device_hashes = self.device_db.source_hashes()
         else:
             self.device_hashes = set()
+        self._update_device_space()
         self._refresh_views()
+
+    def _update_device_space(self):
+        if not self.selected_device:
+            self.device_space_bar.setVisible(False)
+            self.device_space_label.setText("")
+            return
+        try:
+            usage = shutil.disk_usage(self.selected_device.mountpoint)
+        except OSError:
+            self.device_space_bar.setVisible(False)
+            self.device_space_label.setText("")
+            return
+        used_percent = round(usage.used / usage.total * 100) if usage.total else 0
+        self.device_space_bar.setValue(used_percent)
+        self.device_space_bar.setVisible(True)
+        self.device_space_label.setText(
+            tr("device_space_label", free=format_size(usage.free), total=format_size(usage.total))
+        )
 
     def _eject_device(self):
         if not self.selected_device:
@@ -1019,8 +1030,6 @@ class MainWindow(QMainWindow):
             progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
             QApplication.processEvents()
 
-        on_transfer_progress = self._make_transfer_progress_handler(progress)
-
         def on_conflict(track: Track, target_path: Path) -> ConflictResolution:
             reply = QMessageBox.question(
                 self,
@@ -1042,22 +1051,19 @@ class MainWindow(QMainWindow):
             cover_resize=cover_resize,
             track_no_fix=self.settings.track_no_fix,
             on_scan_progress=on_scan_progress,
-            on_transfer_progress=on_transfer_progress,
             force=self.force_checkbox.isChecked(),
+            should_stop=progress.wasCanceled,
         )
         progress.close()
 
-        self._on_device_selected(self.device_combo.currentIndex())
+        self.source_checked_hashes.clear()
+        self.device_checked_hashes.clear()
+        # sync_to_device() scanned the device up front and registered every
+        # file it wrote, so its database is already current -- reopen it to
+        # pick that up, but don't scan the whole card a second time.
+        self._on_device_selected(self.device_combo.currentIndex(), rescan=False)
 
-        message = (
-            f"{tr('sync_result_copied')}: {result.copied}\n"
-            f"{tr('sync_result_present')}: {result.already_present}\n"
-            f"{tr('sync_result_skipped')}: {result.skipped}\n"
-            f"{tr('sync_result_errors')}: {len(result.errors)}"
-        )
-        if result.errors:
-            message += "\n\n" + "\n".join(result.errors[:10])
-        QMessageBox.information(self, tr("sync_done_title"), message)
+        self._show_sync_result(result)
 
     def _sync_tracks_from_device(self, tracks: list[Track], description: str):
         if not self.source_root or not self.library_db:
@@ -1097,8 +1103,6 @@ class MainWindow(QMainWindow):
             progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
             QApplication.processEvents()
 
-        on_transfer_progress = self._make_transfer_progress_handler(progress)
-
         def on_conflict(track: Track, target_path: Path) -> ConflictResolution:
             reply = QMessageBox.question(
                 self,
@@ -1118,21 +1122,29 @@ class MainWindow(QMainWindow):
             on_conflict=on_conflict,
             on_progress=on_progress,
             on_scan_progress=on_scan_progress,
-            on_transfer_progress=on_transfer_progress,
+            should_stop=progress.wasCanceled,
         )
         progress.close()
 
+        self.source_checked_hashes.clear()
+        self.device_checked_hashes.clear()
         self._refresh_views()
 
+        self._show_sync_result(result)
+
+    def _show_sync_result(self, result: SyncResult) -> None:
         message = (
             f"{tr('sync_result_copied')}: {result.copied}\n"
             f"{tr('sync_result_present')}: {result.already_present}\n"
             f"{tr('sync_result_skipped')}: {result.skipped}\n"
             f"{tr('sync_result_errors')}: {len(result.errors)}"
         )
+        if result.cancelled:
+            message = f"{tr('sync_result_cancelled_notice')}\n\n{message}"
         if result.errors:
             message += "\n\n" + "\n".join(result.errors[:10])
-        QMessageBox.information(self, tr("sync_done_title"), message)
+        title = tr("sync_cancelled_title") if result.cancelled else tr("sync_done_title")
+        QMessageBox.information(self, title, message)
 
     # ---------- tag editing ----------
 
@@ -1582,16 +1594,18 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(0)
         progress.show()
 
-        mountpoint = Path(self.selected_device.mountpoint)
-        for index, track in enumerate(tracks, start=1):
+        def on_delete_progress(index: int, total: int, track: Track):
             progress.setValue(index - 1)
-            progress.setLabelText(tr("progress_deleting_label", index=index, total=len(tracks), name=track.filename))
+            progress.setLabelText(tr("progress_deleting_label", index=index, total=total, name=track.filename))
             QApplication.processEvents()
-            delete_from_device(mountpoint, track)
+
+        delete_many_from_device(Path(self.selected_device.mountpoint), tracks, on_progress=on_delete_progress)
         progress.setValue(len(tracks))
         progress.close()
 
-        self._on_device_selected(self.device_combo.currentIndex())
+        # Deletion removed exactly these files and their rows, so the device
+        # database stays accurate -- no rescan needed to reflect it.
+        self._on_device_selected(self.device_combo.currentIndex(), rescan=False)
 
     def _delete_device_album(self, artist: str, album: str):
         if not self.device_db:
