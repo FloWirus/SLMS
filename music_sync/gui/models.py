@@ -132,9 +132,6 @@ class TrackTableModel(QAbstractTableModel):
     def track_at(self, row: int) -> Track:
         return self._tracks[row]
 
-    def checked_tracks(self) -> list[Track]:
-        return [t for t in self._tracks if t.hash in self._checked_hashes]
-
     def all_checked(self) -> bool:
         return bool(self._tracks) and all(t.hash in self._checked_hashes for t in self._tracks)
 

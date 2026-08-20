@@ -185,14 +185,6 @@ class MusicDatabase:
         ).fetchall()
         return [Track.from_row(r) for r in rows]
 
-    def hashes(self) -> set[str]:
-        rows = self.conn.execute("SELECT hash FROM tracks").fetchall()
-        return {r["hash"] for r in rows}
-
-    def get_by_hash(self, hash_: str) -> Track | None:
-        row = self.conn.execute("SELECT * FROM tracks WHERE hash = ?", (hash_,)).fetchone()
-        return Track.from_row(row) if row else None
-
     def source_hashes(self) -> set[str]:
         rows = self.conn.execute("SELECT source_hash FROM tracks").fetchall()
         return {r["source_hash"] for r in rows}
@@ -212,14 +204,6 @@ class MusicDatabase:
     def get_by_path(self, path: str) -> Track | None:
         row = self.conn.execute("SELECT * FROM tracks WHERE path = ?", (path,)).fetchone()
         return Track.from_row(row) if row else None
-
-    def update_field(self, track_id: int, **fields):
-        if not fields:
-            return
-        set_clause = ", ".join(f"{k} = :{k}" for k in fields)
-        fields["id"] = track_id
-        self.conn.execute(f"UPDATE tracks SET {set_clause} WHERE id = :id", fields)
-        self._commit()
 
 
 def library_db_path(project_root: Path) -> Path:

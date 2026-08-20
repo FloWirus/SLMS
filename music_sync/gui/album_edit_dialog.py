@@ -20,6 +20,8 @@ from .. import tags as tagsmod
 from ..db import Track
 from ..i18n import tr
 from ..settings import Settings
+from .extended_tags_panel import PANEL_WIDTH as EXTENDED_PANEL_WIDTH
+from .extended_tags_panel import ExtendedTagsPanel
 
 COVER_SIZE = 150
 DIALOG_MIN_SIZE = (650, 480)
@@ -60,7 +62,9 @@ class AlbumEditDialog(QDialog):
         return self.albums[self.index]
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        content_row = QHBoxLayout()
+        left_column = QVBoxLayout()
 
         top_row = QHBoxLayout()
 
@@ -91,14 +95,33 @@ class AlbumEditDialog(QDialog):
         form_layout.addRow(tr("field_genre"), self.genre_edit)
 
         top_row.addLayout(form_layout)
-        layout.addLayout(top_row)
+        left_column.addLayout(top_row)
 
         self.info_label = QLabel()
-        layout.addWidget(self.info_label)
+        left_column.addWidget(self.info_label)
 
+        action_row = QHBoxLayout()
         cover_btn = QPushButton(tr("btn_change_cover_album"))
         cover_btn.clicked.connect(self._choose_cover)
-        layout.addWidget(cover_btn)
+        action_row.addWidget(cover_btn)
+
+        self.more_tags_btn = QPushButton(tr("btn_more_tags"))
+        self.more_tags_btn.setCheckable(True)
+        self.more_tags_btn.toggled.connect(self._toggle_extended_panel)
+        action_row.addWidget(self.more_tags_btn)
+        left_column.addLayout(action_row)
+
+        content_row.addLayout(left_column)
+
+        # Album scope only -- release-level fields (album artist, label,
+        # barcode, ...), not per-track ones like composer. See the same
+        # reasoning in TagEditDialog for why this starts hidden.
+        self.extended_panel = ExtendedTagsPanel("album")
+        self.extended_panel.setFixedWidth(EXTENDED_PANEL_WIDTH)
+        self.extended_panel.setVisible(False)
+        content_row.addWidget(self.extended_panel)
+
+        root_layout.addLayout(content_row)
 
         nav_row = QHBoxLayout()
         self.prev_btn = QPushButton(tr("btn_prev_album"))
@@ -112,14 +135,20 @@ class AlbumEditDialog(QDialog):
         self.next_btn = QPushButton(tr("btn_next_album"))
         self.next_btn.clicked.connect(self._go_next)
         nav_row.addWidget(self.next_btn)
-        layout.addLayout(nav_row)
+        root_layout.addLayout(nav_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText(tr("btn_save_close"))
         buttons.button(QDialogButtonBox.Cancel).setText(tr("btn_cancel"))
         buttons.accepted.connect(self._save_and_close)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        root_layout.addWidget(buttons)
+
+    def _toggle_extended_panel(self, checked: bool):
+        self.more_tags_btn.setText(tr("btn_fewer_tags") if checked else tr("btn_more_tags"))
+        self.extended_panel.setVisible(checked)
+        delta = EXTENDED_PANEL_WIDTH if checked else -EXTENDED_PANEL_WIDTH
+        self.resize(self.width() + delta, self.height())
 
     def _load_index(self, index: int):
         self.index = index
@@ -138,10 +167,19 @@ class AlbumEditDialog(QDialog):
         self.info_label.setText(tr("info_apply_to_all", count=len(tracks)))
         self._load_cover_preview()
 
+        # See the identical reasoning in TagEditDialog._load_index -- rebuild
+        # the field list if the album's format changed, then load values
+        # from the first track (album-scope fields are shared across the
+        # whole album, so any track is representative) regardless of whether
+        # the panel is currently visible.
+        self.extended_panel.set_format(first.format)
+        self.extended_panel.load_values(self.source_root / first.path)
+
         # Snapshot of what was loaded, taken once every widget holds its
         # value: navigation compares against this to decide whether the
         # album's files need writing at all.
         self._loaded_fields = self._current_album_fields()
+        self._loaded_extended_fields = self.extended_panel.current_values()
 
         self.position_label.setText(f"{index + 1} / {len(self.albums)}")
         self.prev_btn.setEnabled(index > 0)
@@ -190,11 +228,13 @@ class AlbumEditDialog(QDialog):
         }
 
     def _is_dirty(self) -> bool:
-        """Whether the album-wide fields or the cover actually differ from
-        what was loaded."""
+        """Whether the album-wide fields, extended tags, or the cover
+        actually differ from what was loaded."""
         if self._new_cover_bytes is not None:
             return True
-        return self._current_album_fields() != self._loaded_fields
+        if self._current_album_fields() != self._loaded_fields:
+            return True
+        return self.extended_panel.current_values() != self._loaded_extended_fields
 
     def _save_current(self) -> bool:
         album_fields = self._current_album_fields()
@@ -203,6 +243,7 @@ class AlbumEditDialog(QDialog):
         track_total = album_fields["track_total"]
         year = album_fields["year"]
         genre = album_fields["genre"]
+        extended_fields = self.extended_panel.current_values()
 
         errors: list[str] = []
         updated_tracks: list[Track] = []
@@ -217,6 +258,7 @@ class AlbumEditDialog(QDialog):
                 "disc_number": track.disc_number,
                 "year": year,
                 "genre": genre,
+                **extended_fields,
             }
             try:
                 tagsmod.write_tags(file_path, fields)

@@ -36,7 +36,6 @@ from .. import devices as devicesmod
 from .. import tags as tagsmod
 from ..converter import (
     CONVERSION_TARGET_ORDER,
-    CONVERSION_TARGETS,
     ConversionSettings,
     CoverResizeSettings,
     ffmpeg_available,

@@ -13,6 +13,7 @@ A simple Linux desktop app (PySide6) for cataloguing a local music library, edit
 - Checkboxes on both the table and tree view let you build a selection of tracks to sync; checking/unchecking is shared and kept in sync between the two views (checking an artist/album cascades to its tracks), with a "Check all"/"Uncheck all" toggle button per pane. When any tracks are checked, the toolbar Sync button for that pane syncs just that selection instead of everything.
 - The tree view marks presence on the other side with a check icon: full green check when every track under an artist/album is present, a muted grey check when only some are.
 - Edit tags (artist, album, title, track number, tracks-in-album, disc number, year, genre) and cover art per track, or for a whole album at once (artist, album, year, genre, tracks-in-album, cover — title/track number stay untouched). Available on both the library and device side (double-click a track, or use the context menu on a track/album) — device-side edits only touch the copy on the device, never the library file.
+- A "More tags…" toggle in both editors widens the window and adds a panel with every further tag mutagen can actually write for that file's format — composer, conductor, lyricist, comment, mood, BPM, ISRC, and more for a single track; release-level ones like album artist, label, catalog number, barcode, or compilation for a whole album (the same track-vs-album split as the basic fields). A field the format can't support is left out rather than offered and failing on save (e.g. MP3 has no plain "comment" tag; M4A/AAC supports only a handful of these to begin with) — FLAC/OGG accept the full set, since Vorbis Comment tags are freeform. Saving applies the basic fields, extended tags, cover, and filename together in one pass.
 - Edit the filename directly from the tag editor.
 - Manually picking a cover in the tag/album editor stores it as-is (no automatic resizing) — the library can hold covers at any resolution.
 - Next/Previous navigation while editing: track editor moves across all tracks (crossing album/artist boundaries); album editor moves between whole albums.
@@ -89,6 +90,7 @@ music_sync/
     icons.py                  hand-drawn checkbox/presence icons
     tag_edit_dialog.py        single-track tag editor (Next/Previous)
     album_edit_dialog.py      album-wide tag editor (Next/Previous album)
+    extended_tags_panel.py    inline "More tags" panel of format-specific extra tags, embedded in both editors above
     media_info_dialog.py      read-only technical info dialog (codec, sample rate, bitrate, ...)
     settings_dialog.py        templates, language, theme, libsoxr/TrackNoFix toggles
     theme.py                  light/dark/auto palette handling
@@ -109,6 +111,7 @@ Prosta aplikacja desktopowa na Linuksa (PySide6) do katalogowania lokalnej bibli
 - Checkboxy zarówno w tabeli, jak i w drzewie pozwalają zbudować zaznaczenie utworów do synchronizacji; zaznaczanie/odznaczanie jest współdzielone i zsynchronizowane między obydwoma widokami (zaznaczenie artysty/albumu kaskadowo zaznacza jego utwory), z przyciskiem „Zaznacz/Odznacz wszystko” w każdym panelu. Gdy cokolwiek jest zaznaczone, przycisk „Synchronizuj” na pasku narzędzi dla danego panelu synchronizuje tylko to zaznaczenie zamiast wszystkiego.
 - Widok drzewa oznacza obecność po drugiej stronie ikoną „✓”: pełny zielony ✓, gdy wszystkie utwory artysty/albumu są obecne, wyszarzony ✓, gdy tylko część.
 - Edycja tagów (artysta, album, tytuł, numer utworu, liczba utworów w albumie, numer płyty, rok, gatunek) i okładki dla pojedynczego utworu lub dla całego albumu naraz (artysta, album, rok, gatunek, liczba utworów, okładka — tytuł i numer utworu pozostają nietknięte). Dostępne zarówno po stronie biblioteki, jak i nośnika (dwuklik na utworze albo menu kontekstowe utworu/albumu) — edycja po stronie nośnika dotyczy tylko kopii na nośniku, nigdy pliku w bibliotece.
+- Przełącznik „Więcej tagów…” w obu edytorach poszerza okno i dodaje panel ze wszystkimi dalszymi tagami, jakie mutagen faktycznie potrafi zapisać dla danego formatu pliku — kompozytor, dyrygent, autor tekstu, komentarz, nastrój, BPM, ISRC i inne dla pojedynczego utworu; pola na poziomie wydania, jak artysta albumu, wytwórnia, numer katalogowy, kod kreskowy czy kompilacja dla całego albumu (ten sam podział utwór/album co w polach podstawowych). Pole, którego dany format nie obsługuje, jest pomijane zamiast oferowane i kończące się błędem przy zapisie (np. MP3 nie ma zwykłego tagu „comment”; M4A/AAC obsługuje tylko garstkę z tych pól) — FLAC/OGG przyjmują cały zestaw, bo tagi Vorbis Comment są dowolne. Zapis stosuje podstawowe pola, rozszerzone tagi, okładkę i nazwę pliku razem w jednym przebiegu.
 - Edycja nazwy pliku bezpośrednio z edytora tagów.
 - Ręczny wybór okładki w edytorze tagów/albumu zapisuje ją bez zmian (bez automatycznego skalowania) — biblioteka może trzymać okładki w dowolnej rozdzielczości.
 - Nawigacja Następny/Poprzedni podczas edycji: edytor utworu przechodzi przez wszystkie utwory (także między albumami/artystami); edytor albumu przechodzi między całymi albumami.
@@ -185,6 +188,7 @@ music_sync/
     icons.py                  ręcznie rysowane ikony checkboxa/obecności
     tag_edit_dialog.py        edytor tagów pojedynczego utworu (Następny/Poprzedni)
     album_edit_dialog.py      edytor tagów albumu (Następny/Poprzedni album)
+    extended_tags_panel.py    panel „Więcej tagów” z dodatkowymi tagami zależnymi od formatu, osadzany w obu edytorach powyżej
     media_info_dialog.py      okno tylko-do-odczytu z danymi technicznymi (kodek, próbkowanie, bitrate, ...)
     settings_dialog.py        szablony, język, motyw, przełączniki libsoxr/TrackNoFix
     theme.py                  obsługa palety jasny/ciemny/auto

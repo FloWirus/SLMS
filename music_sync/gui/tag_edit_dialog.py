@@ -21,6 +21,8 @@ from ..db import Track
 from ..i18n import tr
 from ..settings import Settings
 from ..templating import sanitize_component
+from .extended_tags_panel import PANEL_WIDTH as EXTENDED_PANEL_WIDTH
+from .extended_tags_panel import ExtendedTagsPanel
 
 COVER_SIZE = 150
 DIALOG_MIN_SIZE = (650, 520)
@@ -52,7 +54,9 @@ class TagEditDialog(QDialog):
         self._load_index(self.index)
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        content_row = QHBoxLayout()
+        left_column = QVBoxLayout()
 
         top_row = QHBoxLayout()
 
@@ -91,11 +95,30 @@ class TagEditDialog(QDialog):
         form_layout.addRow(tr("field_filename"), self.filename_edit)
 
         top_row.addLayout(form_layout)
-        layout.addLayout(top_row)
+        left_column.addLayout(top_row)
 
+        action_row = QHBoxLayout()
         cover_btn = QPushButton(tr("btn_change_cover"))
         cover_btn.clicked.connect(self._choose_cover)
-        layout.addWidget(cover_btn)
+        action_row.addWidget(cover_btn)
+
+        self.more_tags_btn = QPushButton(tr("btn_more_tags"))
+        self.more_tags_btn.setCheckable(True)
+        self.more_tags_btn.toggled.connect(self._toggle_extended_panel)
+        action_row.addWidget(self.more_tags_btn)
+        left_column.addLayout(action_row)
+
+        content_row.addLayout(left_column)
+
+        # Hidden until "More tags" is toggled on -- widening the dialog only
+        # then, rather than always reserving the space, keeps the common
+        # case (editing the handful of basic fields) uncluttered.
+        self.extended_panel = ExtendedTagsPanel("track")
+        self.extended_panel.setFixedWidth(EXTENDED_PANEL_WIDTH)
+        self.extended_panel.setVisible(False)
+        content_row.addWidget(self.extended_panel)
+
+        root_layout.addLayout(content_row)
 
         nav_row = QHBoxLayout()
         self.prev_btn = QPushButton(tr("btn_prev"))
@@ -109,14 +132,20 @@ class TagEditDialog(QDialog):
         self.next_btn = QPushButton(tr("btn_next"))
         self.next_btn.clicked.connect(self._go_next)
         nav_row.addWidget(self.next_btn)
-        layout.addLayout(nav_row)
+        root_layout.addLayout(nav_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText(tr("btn_save_close"))
         buttons.button(QDialogButtonBox.Cancel).setText(tr("btn_cancel"))
         buttons.accepted.connect(self._save_and_close)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        root_layout.addWidget(buttons)
+
+    def _toggle_extended_panel(self, checked: bool):
+        self.more_tags_btn.setText(tr("btn_fewer_tags") if checked else tr("btn_more_tags"))
+        self.extended_panel.setVisible(checked)
+        delta = EXTENDED_PANEL_WIDTH if checked else -EXTENDED_PANEL_WIDTH
+        self.resize(self.width() + delta, self.height())
 
     def _load_index(self, index: int):
         self.index = index
@@ -137,11 +166,20 @@ class TagEditDialog(QDialog):
         self.filename_edit.setText(self.file_path.stem)
         self._load_cover_preview()
 
+        # Rebuilds the field list if this track's format differs from the
+        # previous one (e.g. an mp3 next to a flac in the same sequence),
+        # then loads this track's current extended-tag values regardless of
+        # whether the panel is currently visible, so toggling it on later
+        # always shows correct data.
+        self.extended_panel.set_format(track.format)
+        self.extended_panel.load_values(self.file_path)
+
         # Snapshot of what was loaded, taken once every widget holds its
         # value: navigation compares against this to decide whether the file
         # needs writing at all.
         self._loaded_fields = self._current_fields()
         self._loaded_stem = self.file_path.stem
+        self._loaded_extended_fields = self.extended_panel.current_values()
 
         self.position_label.setText(f"{index + 1} / {len(self.tracks)}")
         self.prev_btn.setEnabled(index > 0)
@@ -205,16 +243,19 @@ class TagEditDialog(QDialog):
 
     def _is_dirty(self) -> bool:
         """Whether anything the user can edit here actually differs from what
-        was loaded -- tags, filename or cover."""
+        was loaded -- tags, extended tags, filename or cover."""
         if self._new_cover_bytes is not None:
             return True
         if self._current_fields() != self._loaded_fields:
+            return True
+        if self.extended_panel.current_values() != self._loaded_extended_fields:
             return True
         new_stem = self._new_stem()
         return new_stem is not None and new_stem != self._loaded_stem
 
     def _save_current(self) -> bool:
         fields = self._current_fields()
+        fields.update(self.extended_panel.current_values())
         try:
             tagsmod.write_tags(self.file_path, fields)
             if self._new_cover_bytes is not None:
