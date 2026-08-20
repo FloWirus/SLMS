@@ -33,6 +33,7 @@ class SyncResult:
     copied: int = 0
     skipped: int = 0
     already_present: int = 0
+    duplicates_removed: int = 0
     errors: list[str] | None = None
     cancelled: bool = False
 
@@ -315,6 +316,17 @@ def _copy_tracks(
             target_source_hashes.add(track.hash)
             result.copied += 1
             logger.info(tr("log_sync_copied", index=index, total=total, source=track.path, target=rel_target))
+
+            # A dir/filename template change followed by a forced re-sync
+            # copies this track to its new rel_target above, but without
+            # this, its old copy under the previous template's path would
+            # never be removed -- force is meant to converge the device onto
+            # the current template, not accumulate one stale copy per past
+            # template. Best-effort and separate from the try/except above:
+            # a failure here must not be reported as the copy itself having
+            # failed, since it didn't.
+            if force:
+                result.duplicates_removed += _remove_stale_duplicates(target_db, target_root, track.hash, rel_target)
         except (OSError, subprocess.CalledProcessError) as exc:
             logger.error(tr("log_sync_copy_error", path=track.path, error=exc))
             result.errors.append(f"{track.path}: {exc}")
@@ -491,6 +503,34 @@ def remove_empty_parent_dirs(start_dir: Path, root: Path) -> None:
         except OSError:
             break
         current = current.parent
+
+
+def _remove_stale_duplicates(target_db: MusicDatabase, target_root: Path, source_hash: str, current_rel_target: str) -> int:
+    """After a forced re-sync just (re)wrote `source_hash`'s track to
+    `current_rel_target`, delete every other copy of it still registered on
+    the target -- left behind by an earlier sync under a dir/filename
+    template that has since changed. Without this, a template change plus
+    Force leaves both the old and the new copy on the device instead of
+    converging on one.
+
+    Best-effort: a missing file or a locked/unwritable one is logged and
+    skipped rather than raised, since the copy this follows already
+    succeeded and must not be reported as failed over cleanup of a leftover."""
+    removed = 0
+    for stale in target_db.get_all_by_source_hash(source_hash):
+        if stale.path == current_rel_target:
+            continue
+        stale_path = target_root / stale.path
+        try:
+            if stale_path.exists():
+                stale_path.unlink()
+                remove_empty_parent_dirs(stale_path.parent, target_root)
+            target_db.delete_by_path(stale.path)
+            removed += 1
+            logger.info(tr("log_sync_removed_stale_duplicate", old_path=stale.path, new_path=current_rel_target))
+        except OSError as exc:
+            logger.warning(tr("log_sync_stale_duplicate_cleanup_failed", path=stale.path, error=exc))
+    return removed
 
 
 def delete_many_from_device(

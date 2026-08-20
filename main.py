@@ -16,6 +16,7 @@ except ModuleNotFoundError:
         "Uruchom: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
     )
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from music_sync.constants import DB_DIRNAME, app_data_dir
@@ -63,6 +64,14 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("SLMS")
     app.setApplicationDisplayName("SLMS")
+
+    icon_path = PROJECT_ROOT / "packaging" / "icon.png"
+    if icon_path.is_file():
+        # Without this, running from source (as opposed to the AppImage,
+        # which carries its own .desktop/icon association) leaves the window
+        # with no icon at all, so the window manager's taskbar/alt-tab shows
+        # a generic placeholder instead of SLMS's own icon.
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     init_theme(app)
     apply_theme(app, Settings.load(data_dir).theme)

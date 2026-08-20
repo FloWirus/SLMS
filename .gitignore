@@ -5,4 +5,5 @@ music_db/
 PROJECT.md
 .claude/
 dist/
-packaging/
+packaging/*
+!packaging/icon.png

@@ -197,6 +197,8 @@ class MainWindow(QMainWindow):
         source_pane, self.source_check_all_btn = self._build_pane(
             tr("pane_source_title"), self.table_view, self.tree_widget, self._toggle_check_all_source
         )
+        self.source_stats_label = QLabel()
+        source_pane.layout().addWidget(self.source_stats_label)
         splitter.addWidget(source_pane)
 
         self.device_table_view = self._build_table_view(
@@ -215,21 +217,35 @@ class MainWindow(QMainWindow):
             self.device_tree_widget,
             self._toggle_check_all_device,
         )
+        self.device_stats_label = QLabel()
+        self.device_stats_separator = QLabel("|")
         self.device_space_bar = QProgressBar()
         self.device_space_bar.setMaximum(100)
         self.device_space_bar.setTextVisible(False)
         self.device_space_bar.setFixedHeight(8)
-        self.device_space_bar.setVisible(False)
-        device_pane.layout().addWidget(self.device_space_bar)
+
         self.device_space_label = QLabel()
-        device_pane.layout().addWidget(self.device_space_label)
+
+        self._device_status_row = QHBoxLayout()
+        self._device_status_row.addWidget(self.device_stats_label)
+        self._device_status_row.addWidget(self.device_stats_separator)
+        # Stretch factor 1 on the bar plus an equal-weight trailing stretch
+        # splits the row's leftover width 50/50 between the bar and empty
+        # space, instead of the bar expanding to fill the whole row. The
+        # free/total text sits right after the bar, outside that split, so
+        # it always hugs the bar instead of drifting off with the stretch.
+        self._device_status_row.addWidget(self.device_space_bar, 1)
+        self._device_status_row.addWidget(self.device_space_label)
+        self._device_status_row.addStretch(1)
+        device_pane.layout().addLayout(self._device_status_row)
+        self._clear_device_status()
         splitter.addWidget(device_pane)
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
         layout.addWidget(splitter, 1)
 
-        self.status_label = QLabel(tr("status_choose_directory"))
+        self.status_label = QLabel()
         layout.addWidget(self.status_label, 0)
 
         conversion_bar = self._build_conversion_bar()
@@ -349,6 +365,8 @@ class MainWindow(QMainWindow):
         self.convert_target_combo = QComboBox()
         for key in CONVERSION_TARGET_ORDER:
             self.convert_target_combo.addItem(tr(f"conversion_target_{key}"), key)
+        self.convert_target_combo.setEnabled(self.convert_checkbox.isChecked())
+        self.convert_checkbox.toggled.connect(self.convert_target_combo.setEnabled)
         row.addWidget(self.convert_target_combo)
 
         row.addStretch()
@@ -373,6 +391,11 @@ class MainWindow(QMainWindow):
         self.cover_dpi_edit.setValidator(QIntValidator(1, 2400, self))
         self.cover_dpi_edit.setMaximumWidth(70)
         row.addWidget(self.cover_dpi_edit)
+
+        self.cover_size_edit.setEnabled(self.resize_cover_checkbox.isChecked())
+        self.cover_dpi_edit.setEnabled(self.resize_cover_checkbox.isChecked())
+        self.resize_cover_checkbox.toggled.connect(self.cover_size_edit.setEnabled)
+        self.resize_cover_checkbox.toggled.connect(self.cover_dpi_edit.setEnabled)
 
         row.addStretch()
         return row
@@ -560,8 +583,6 @@ class MainWindow(QMainWindow):
         self.source_root = directory
         self.library_db = MusicDatabase(library_db_path(self.project_root))
         self._refresh_views()
-        count = len(self.library_db.all_tracks())
-        self.status_label.setText(tr("status_loaded_library", count=count, path=self.source_root))
 
     def _scan_with_progress(self, root: Path, db: MusicDatabase) -> tuple[list, bool]:
         """Scan root and reconcile db with what's actually on disk (drops
@@ -600,7 +621,10 @@ class MainWindow(QMainWindow):
         if cancelled:
             self.status_label.setText(tr("status_scan_cancelled", count=len(tracks)))
         else:
-            self.status_label.setText(tr("status_scan_done", count=len(tracks), path=self.source_root))
+            # Track/album/artist counts are now shown directly under each
+            # panel (see _refresh_source_views), so a redundant "found N
+            # tracks" status line isn't needed on a normal, uncancelled scan.
+            self.status_label.clear()
 
     def _rescan_device(self):
         if not self.selected_device or not self.device_db:
@@ -614,7 +638,7 @@ class MainWindow(QMainWindow):
         if cancelled:
             self.status_label.setText(tr("status_scan_cancelled", count=len(tracks)))
         else:
-            self.status_label.setText(tr("status_scan_done", count=len(tracks), path=self.selected_device.mountpoint))
+            self.status_label.clear()
 
     def _scan_device_directory(self) -> tuple[list, bool]:
         return self._scan_with_progress(Path(self.selected_device.mountpoint), self.device_db)
@@ -625,12 +649,18 @@ class MainWindow(QMainWindow):
 
     def _refresh_source_views(self):
         if not self.library_db:
+            # Left blank rather than hidden: an empty QLabel still reserves
+            # its line height, so the pane doesn't grow/shrink the moment a
+            # library gets chosen -- see the identical reasoning on the
+            # device side (_clear_device_status).
+            self.source_stats_label.setText("")
             return
         tracks = self.library_db.all_tracks()
         self.table_model.set_tracks(tracks)
         self.table_model.set_device_hashes(self.device_hashes)
         self._populate_tree(self.tree_widget, tracks, self.device_hashes, self.source_checked_hashes)
         self._update_check_all_button(self.source_check_all_btn, self.table_model)
+        self.source_stats_label.setText(tr("stats_label", **self._track_stats(tracks)))
 
     def _refresh_device_views(self):
         tracks = self.device_db.all_tracks() if self.device_db else []
@@ -639,6 +669,19 @@ class MainWindow(QMainWindow):
         self.device_table_model.set_device_hashes(library_hashes)
         self._populate_tree(self.device_tree_widget, tracks, library_hashes, self.device_checked_hashes)
         self._update_check_all_button(self.device_check_all_btn, self.device_table_model)
+        self.device_stats_label.setText(tr("stats_label", **self._track_stats(tracks)) if self.device_db else "")
+
+    @staticmethod
+    def _track_stats(tracks: list[Track]) -> dict[str, int]:
+        # Same artist/album grouping (with the "unknown" fallback) as the
+        # tree view, so these counts match what it actually shows.
+        artists: set[str] = set()
+        albums: set[tuple[str, str]] = set()
+        for track in tracks:
+            artist = track.artist or tr("unknown_artist")
+            artists.add(artist)
+            albums.add((artist, track.album or tr("unknown_album")))
+        return {"artists": len(artists), "albums": len(albums), "tracks": len(tracks)}
 
     def _toggle_check_all_source(self):
         if not self.library_db:
@@ -865,20 +908,27 @@ class MainWindow(QMainWindow):
         self._update_device_space()
         self._refresh_views()
 
+    def _clear_device_status(self) -> None:
+        # Cleared rather than hidden: this row (stats, bar, free/total text)
+        # must occupy the same height whether or not a device is selected,
+        # otherwise the panel resizes every time a device gets picked or
+        # deselected -- a QLabel/QProgressBar left visible with blank
+        # content still reserves its normal height, an invisible one doesn't.
+        self.device_stats_label.setText("")
+        self.device_space_bar.setValue(0)
+        self.device_space_label.setText("")
+
     def _update_device_space(self):
         if not self.selected_device:
-            self.device_space_bar.setVisible(False)
-            self.device_space_label.setText("")
+            self._clear_device_status()
             return
         try:
             usage = shutil.disk_usage(self.selected_device.mountpoint)
         except OSError:
-            self.device_space_bar.setVisible(False)
-            self.device_space_label.setText("")
+            self._clear_device_status()
             return
         used_percent = round(usage.used / usage.total * 100) if usage.total else 0
         self.device_space_bar.setValue(used_percent)
-        self.device_space_bar.setVisible(True)
         self.device_space_label.setText(
             tr("device_space_label", free=format_size(usage.free), total=format_size(usage.total))
         )
@@ -1139,6 +1189,8 @@ class MainWindow(QMainWindow):
             f"{tr('sync_result_skipped')}: {result.skipped}\n"
             f"{tr('sync_result_errors')}: {len(result.errors)}"
         )
+        if result.duplicates_removed:
+            message += f"\n{tr('sync_result_duplicates_removed')}: {result.duplicates_removed}"
         if result.cancelled:
             message = f"{tr('sync_result_cancelled_notice')}\n\n{message}"
         if result.errors:

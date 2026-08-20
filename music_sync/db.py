@@ -201,6 +201,14 @@ class MusicDatabase:
         row = self.conn.execute("SELECT * FROM tracks WHERE source_hash = ?", (hash_,)).fetchone()
         return Track.from_row(row) if row else None
 
+    def get_all_by_source_hash(self, hash_: str) -> list[Track]:
+        """Every row for a given source hash. source_hash is not unique --
+        normally there is at most one, but a template change followed by a
+        force re-sync can leave the same track registered under more than
+        one path until that duplicate is cleaned up."""
+        rows = self.conn.execute("SELECT * FROM tracks WHERE source_hash = ?", (hash_,)).fetchall()
+        return [Track.from_row(row) for row in rows]
+
     def get_by_path(self, path: str) -> Track | None:
         row = self.conn.execute("SELECT * FROM tracks WHERE path = ?", (path,)).fetchone()
         return Track.from_row(row) if row else None
