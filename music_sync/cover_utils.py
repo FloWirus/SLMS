@@ -8,6 +8,18 @@ METERS_PER_INCH = 0.0254
 JPEG_QUALITY = 90
 
 
+def _encode_image(image: QImage, fmt: str) -> bytes:
+    byte_array = QByteArray()
+    buffer = QBuffer(byte_array)
+    buffer.open(QIODevice.WriteOnly)
+    if fmt == "JPEG":
+        image.save(buffer, fmt, quality=JPEG_QUALITY)
+    else:
+        image.save(buffer, fmt)
+    buffer.close()
+    return bytes(byte_array)
+
+
 def resize_cover_bytes(data: bytes, mime: str, max_size: int, dpi: int) -> bytes:
     """Scale the image down so its longer side equals max_size (aspect ratio
     kept) and stamp the given DPI into the output. A non-positive max_size or
@@ -27,15 +39,40 @@ def resize_cover_bytes(data: bytes, mime: str, max_size: int, dpi: int) -> bytes
         image.setDotsPerMeterY(dots_per_meter)
 
     fmt = "PNG" if mime == "image/png" else "JPEG"
-    byte_array = QByteArray()
-    buffer = QBuffer(byte_array)
-    buffer.open(QIODevice.WriteOnly)
-    if fmt == "JPEG":
-        image.save(buffer, fmt, quality=JPEG_QUALITY)
-    else:
-        image.save(buffer, fmt)
-    buffer.close()
-    return bytes(byte_array)
+    return _encode_image(image, fmt)
+
+
+def normalize_manual_cover(data: bytes, suffix: str) -> tuple[bytes, str]:
+    """For a manually picked cover file (the tag/album editor's "Change
+    cover" button): .jpg/.jpeg/.png are embedded byte-for-byte, unchanged --
+    covers stay "as-is", at whatever resolution/quality the user picked,
+    matching this app's documented behavior for manual picks. Any other
+    format the file picker offers (currently just .webp) isn't reliably
+    embeddable/displayable across audio tag formats and players -- MP4
+    cover atoms in particular only accept JPEG/PNG at all -- so it's decoded
+    and re-encoded once into PNG (if it has transparency) or JPEG, the same
+    normalization the sync-time cover-resize path already applies to
+    anything that isn't already jpeg/png.
+
+    `suffix` is the picked file's extension (e.g. ".webp"), used only to
+    fast-path the already-safe jpeg/png case without decoding it at all.
+    """
+    suffix = suffix.lower()
+    if suffix in (".jpg", ".jpeg"):
+        return data, "image/jpeg"
+    if suffix == ".png":
+        return data, "image/png"
+
+    image = QImage()
+    image.loadFromData(data)
+    if image.isNull():
+        # Not decodable -- pass through as-is and let the caller's own tag
+        # write fail loudly, rather than silently discarding the pick.
+        return data, "image/jpeg"
+
+    if image.hasAlphaChannel():
+        return _encode_image(image, "PNG"), "image/png"
+    return _encode_image(image, "JPEG"), "image/jpeg"
 
 
 def read_image_info(data: bytes) -> tuple[int, int, int] | None:

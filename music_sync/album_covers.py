@@ -10,6 +10,25 @@ LOOSE_COVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
 # order. Checked before falling back to "the directory holds exactly one
 # image", so an album with front.jpg + back.jpg still resolves correctly.
 PREFERRED_COVER_STEMS = ("cover", "folder", "front", "album", "albumart", "artwork")
+# What write_loose_cover names the files it creates. "cover" is the first
+# entry in PREFERRED_COVER_STEMS, so a cover written here always wins over
+# any other loose image already sitting in the album directory.
+LOOSE_COVER_FILENAME = "cover.jpg"
+
+
+def write_loose_cover(album_dir: Path, data: bytes) -> Path:
+    """Write `data` (JPEG bytes) as the album directory's loose cover,
+    overwriting an existing cover.jpg.
+
+    Note this is the one place where this app *creates* a loose cover file
+    rather than only reading one -- see find_loose_cover's note about
+    artwork otherwise staying exactly where the user put it. It exists so a
+    cover fetched from Tidal is also visible to file managers and to players
+    that read cover.jpg instead of embedded tags.
+    """
+    path = album_dir / LOOSE_COVER_FILENAME
+    path.write_bytes(data)
+    return path
 
 
 def find_loose_cover(album_dir: Path) -> Path | None:

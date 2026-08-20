@@ -1,2 +1,3 @@
 PySide6>=6.11
 mutagen>=1.46
+requests>=2.31
