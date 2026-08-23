@@ -28,6 +28,11 @@ from .extended_tags_panel import PANEL_WIDTH as EXTENDED_PANEL_WIDTH
 from .extended_tags_panel import ExtendedTagsPanel
 from .tidal_cover_worker import TidalCoverWorker
 
+# Separator between per-file values when a field isn't the same across the
+# edited tracks: "artist1;artist2;artist3". Editing one segment retargets
+# that one file; replacing the whole list with a single value applies it to
+# all of them (see _values_for_field).
+MULTI_VALUE_SEPARATOR = ";"
 COVER_SIZE = 150
 DIALOG_MIN_SIZE = (650, 480)
 TIDAL_COVER_SIZE = 1280
@@ -58,6 +63,11 @@ class AlbumEditDialog(QDialog):
         self.settings = settings
         self._new_cover_bytes: bytes | None = None
         self._new_cover_mime = "image/jpeg"
+        # Full-resolution copy of whatever the preview is showing.
+        # cover_label only ever holds a COVER_SIZE thumbnail, so reading the
+        # pixmap back off the label reports COVER_SIZE for every cover, no
+        # matter how large the artwork actually is.
+        self._cover_pixmap: QPixmap | None = None
         # Only covers fetched from Tidal are also written out as cover.jpg;
         # a manually picked file is left alone, since the user already has
         # that image on disk wherever they chose it from.
@@ -198,6 +208,17 @@ class AlbumEditDialog(QDialog):
         # grows/shrinks the window on the right where the panel lives.
         self.adjustSize()
 
+    @staticmethod
+    def _joined_value(tracks: list[Track], attr: str) -> str:
+        """What to show in a field: the plain value when every track agrees,
+        otherwise each track's own value in tree order, ";"-separated. The
+        differing values stay visible and editable instead of being hidden
+        behind whichever track happened to load first."""
+        values = [getattr(track, attr) for track in tracks]
+        if len(set(values)) == 1:
+            return values[0]
+        return MULTI_VALUE_SEPARATOR.join(values)
+
     def _load_index(self, index: int):
         self.index = index
         tracks = self.albums[index]
@@ -208,11 +229,14 @@ class AlbumEditDialog(QDialog):
 
         album_name = first.album or tr("unknown_album")
         self.setWindowTitle(tr("dialog_title_edit_album", album=album_name, count=len(tracks)))
-        self.artist_edit.setText(first.artist)
-        self.album_edit.setText(first.album)
-        self.track_total_edit.setText(first.track_total)
-        self.year_edit.setText(first.year)
-        self.genre_edit.setText(first.genre)
+        for edit, attr in (
+            (self.artist_edit, "artist"),
+            (self.album_edit, "album"),
+            (self.track_total_edit, "track_total"),
+            (self.year_edit, "year"),
+            (self.genre_edit, "genre"),
+        ):
+            edit.setText(self._joined_value(tracks, attr))
         self.info_label.setText(tr("info_apply_to_all", count=len(tracks)))
         self._load_cover_preview()
 
@@ -234,20 +258,31 @@ class AlbumEditDialog(QDialog):
         self.prev_btn.setEnabled(index > 0)
         self.next_btn.setEnabled(index < len(self.albums) - 1)
 
+    def _show_cover_preview(self, pixmap: QPixmap | None):
+        """Put `pixmap` in the cover preview, keeping the unscaled original
+        on self. Everything that needs the artwork's real dimensions -- the
+        size label, the Tidal comparison -- has to read that copy rather
+        than cover_label's downscaled thumbnail."""
+        self._cover_pixmap = pixmap
+        if pixmap is None or pixmap.isNull():
+            self.cover_label.clear()
+            self.cover_label.setText(tr("cover_none"))
+            self.cover_size_label.clear()
+            return
+        self.cover_label.setPixmap(
+            pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
+
     def _load_cover_preview(self):
         file_path = self.source_root / self.tracks[0].path
         data = tagsmod.read_cover_art(file_path)
         if data:
             pixmap = QPixmap()
             pixmap.loadFromData(data)
-            self.cover_label.setPixmap(
-                pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-            self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
+            self._show_cover_preview(pixmap)
         else:
-            self.cover_label.clear()
-            self.cover_label.setText(tr("cover_none"))
-            self.cover_size_label.clear()
+            self._show_cover_preview(None)
 
     def _choose_cover(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -262,10 +297,7 @@ class AlbumEditDialog(QDialog):
         self._new_cover_write_loose = False
         pixmap = QPixmap()
         pixmap.loadFromData(cover_bytes)
-        self.cover_label.setPixmap(
-            pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-        self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
+        self._show_cover_preview(pixmap)
 
     def _download_cover_from_tidal(self):
         artist = self.artist_edit.text().strip()
@@ -304,18 +336,14 @@ class AlbumEditDialog(QDialog):
         new_pixmap = QPixmap()
         new_pixmap.loadFromData(cover_bytes)
 
-        old_pixmap = self.cover_label.pixmap()
-        confirm = CoverCompareDialog(old_pixmap, new_pixmap, self)
+        confirm = CoverCompareDialog(self._cover_pixmap, new_pixmap, self)
         if confirm.exec() != QDialog.Accepted:
             return
 
         self._new_cover_bytes = cover_bytes
         self._new_cover_mime = mime
         self._new_cover_write_loose = True
-        self.cover_label.setPixmap(
-            new_pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-        self.cover_size_label.setText(f"{new_pixmap.width()}x{new_pixmap.height()}")
+        self._show_cover_preview(new_pixmap)
 
     def _current_album_fields(self) -> dict:
         return {
@@ -335,28 +363,59 @@ class AlbumEditDialog(QDialog):
             return True
         return self.extended_panel.current_values() != self._loaded_extended_fields
 
+    def _values_for_field(self, text: str) -> list[str]:
+        """One value per edited track, from what the field now holds.
+
+        A ";"-separated list with exactly one segment per track keeps the
+        per-file mapping, so correcting a single entry of
+        "artist1;artist2;artist3" only touches that file. Anything else --
+        most importantly the whole list replaced by one name -- is applied
+        to every track, which is how a mixed selection gets unified."""
+        count = len(self.tracks)
+        parts = [part.strip() for part in text.split(MULTI_VALUE_SEPARATOR)]
+        if count > 1 and len(parts) == count:
+            return parts
+        return [text] * count
+
     def _save_current(self) -> bool:
         album_fields = self._current_album_fields()
-        artist = album_fields["artist"]
-        album = album_fields["album"]
-        track_total = album_fields["track_total"]
-        year = album_fields["year"]
-        genre = album_fields["genre"]
-        extended_fields = self.extended_panel.current_values()
+        # Only fields the user actually edited get applied to every track.
+        # An untouched field keeps each file's own value, which is what makes
+        # editing a mixed selection safe: changing just the album name can't
+        # overwrite three different artists with whichever one happened to
+        # load into the box.
+        changed = {key for key, value in album_fields.items() if value != self._loaded_fields.get(key)}
+        resolved = {key: self._values_for_field(album_fields[key]) for key in changed}
+        # Same rule for extended tags, via omission: write_tags leaves out
+        # any key absent from `fields`, so an unedited extended tag is never
+        # written and each file keeps whatever it already had. (These load
+        # from the first track only -- reading every file to detect mixed
+        # values would mean re-parsing the whole selection on open -- so
+        # "don't write what wasn't edited" is what protects them.)
+        loaded_extended = self._loaded_extended_fields
+        extended_fields = {
+            key: value
+            for key, value in self.extended_panel.current_values().items()
+            if value != loaded_extended.get(key)
+        }
 
         errors: list[str] = []
         updated_tracks: list[Track] = []
-        for track in self.tracks:
+        for position, track in enumerate(self.tracks):
             file_path = self.source_root / track.path
+
+            def value_of(key: str, own: str, position=position) -> str:
+                return resolved[key][position] if key in resolved else own
+
             fields = {
-                "artist": artist,
-                "album": album,
+                "artist": value_of("artist", track.artist),
+                "album": value_of("album", track.album),
                 "title": track.title,
                 "track_number": track.track_number,
-                "track_total": track_total,
+                "track_total": value_of("track_total", track.track_total),
                 "disc_number": track.disc_number,
-                "year": year,
-                "genre": genre,
+                "year": value_of("year", track.year),
+                "genre": value_of("genre", track.genre),
                 **extended_fields,
             }
             try:

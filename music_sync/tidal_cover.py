@@ -40,7 +40,7 @@ SEARCH_LIMIT = 20
 # (Tidal changes markets over time -- an unsupported code doesn't error, it
 # just comes back with no items, so an outdated entry costs a wasted request
 # rather than a failure.)
-SEARCH_COUNTRIES = ("PL", "US")
+SEARCH_COUNTRIES = ("PL", "US", "FI")
 # Once candidates are within this margin of the best text-match score,
 # they're treated as an equally valid textual match (e.g. a single and the
 # album it's later folded into both containing the same title word) and
@@ -97,10 +97,29 @@ def _token_overlap(query: str, candidate: str) -> float:
     return len(query_tokens & candidate_tokens) / len(query_tokens)
 
 
+def _artist_score(item: dict, artist: str) -> float:
+    """Best match across *every* artist credited on the album, not just the
+    main one. Tidal files collaborations and duet albums under a single
+    lead artist (e.g. "Kasia i Błażej" sits under Nosowska, with Błażej
+    Król only in the `artists` list) -- scoring the lead alone makes such an
+    album look like a wrong-artist hit, and any unrelated album by the
+    queried artist then outranks it despite a perfect title match."""
+    names = [
+        credited.get("name", "")
+        for credited in (item.get("artists") or [])
+        if credited.get("name")
+    ]
+    main_artist = (item.get("artist") or {}).get("name", "")
+    if main_artist:
+        names.append(main_artist)
+    if not names:
+        return 0.0
+    return max(_similarity(artist, name) for name in names)
+
+
 def _match_score(item: dict, artist: str, album: str) -> float:
-    item_artist = (item.get("artist") or {}).get("name", "")
     item_title = item.get("title", "")
-    artist_score = _similarity(artist, item_artist)
+    artist_score = _artist_score(item, artist)
     title_score = 0.7 * _token_overlap(album, item_title) + 0.3 * _similarity(album, item_title)
     # Weighted toward the artist: a wrong artist with a similarly-named
     # album is a worse mismatch than a slightly different album title from

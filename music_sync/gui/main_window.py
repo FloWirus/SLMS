@@ -2,7 +2,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QObject, Qt, QThread, Signal
+from PySide6.QtCore import QByteArray, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import QSortFilterProxyModel
 
 from .. import devices as devicesmod
 from .. import tags as tagsmod
@@ -55,9 +54,18 @@ from ..sync import (
 from .album_edit_dialog import AlbumEditDialog
 from .icons import full_presence_icon, partial_presence_icon
 from .media_info_dialog import MediaInfoDialog
-from .models import COLUMN_KEYS, TrackTableModel, format_size, polish_sort_key
+from .models import COLUMN_KEYS, TrackFilterProxyModel, TrackTableModel, format_size, polish_sort_key
 from .settings_dialog import SettingsDialog
 from .tag_edit_dialog import TagEditDialog
+
+# Item data role holding a tree node's lowercased label for the search box.
+# Qt.UserRole itself is taken -- the tree stores each node's {"type": ...}
+# descriptor there.
+SEARCH_TEXT_ROLE = Qt.UserRole + 1
+
+# How long typing has to pause before the search actually runs. Long enough
+# to swallow a run of keystrokes, short enough to still feel live.
+SEARCH_DEBOUNCE_MS = 150
 from .theme import apply_theme
 
 logger = logging.getLogger(__name__)
@@ -134,6 +142,17 @@ class MainWindow(QMainWindow):
         self.source_checked_hashes: set[str] = set()
         self.device_checked_hashes: set[str] = set()
         self._updating_checks = False
+        # Live search state, per tree widget: the text currently typed (the
+        # tree has no proxy model, so the filter has to be re-applied by
+        # hand every time _populate_tree rebuilds it) and the expansion
+        # snapshot taken when filtering started, so clearing the box gives
+        # the user back the tree they had rather than a fully expanded one.
+        self._tree_filter_text: dict[QTreeWidget, str] = {}
+        self._tree_prefilter_state: dict[QTreeWidget, tuple[set, set]] = {}
+        # Debounce timers and the not-yet-applied query per tree, so a burst
+        # of keystrokes costs one filter pass -- see _apply_search_filter.
+        self._search_debounce: dict[QTreeWidget, QTimer] = {}
+        self._pending_filter_text: dict[QTreeWidget, tuple[str, TrackFilterProxyModel]] = {}
 
         self.setWindowTitle(APP_NAME)
         self.resize(1000, 650)
@@ -193,8 +212,11 @@ class MainWindow(QMainWindow):
         self.table_model = self.table_view.model().sourceModel()
         self.proxy_model = self.table_view.model()
         self.tree_widget = self._build_tree_widget(self._tree_context_menu, self._edit_tree_item)
-        source_pane, self.source_check_all_btn = self._build_pane(
+        source_pane, self.source_check_all_btn, self.source_search_edit = self._build_pane(
             tr("pane_source_title"), self.table_view, self.tree_widget, self._toggle_check_all_source
+        )
+        self.source_search_edit.textChanged.connect(
+            lambda text: self._apply_search_filter(text, self.proxy_model, self.tree_widget)
         )
         self.source_stats_label = QLabel()
         source_pane.layout().addWidget(self.source_stats_label)
@@ -210,11 +232,14 @@ class MainWindow(QMainWindow):
         self.device_table_model = self.device_table_view.model().sourceModel()
         self.device_proxy_model = self.device_table_view.model()
         self.device_tree_widget = self._build_tree_widget(self._device_tree_context_menu, self._edit_device_tree_item)
-        device_pane, self.device_check_all_btn = self._build_pane(
+        device_pane, self.device_check_all_btn, self.device_search_edit = self._build_pane(
             tr("pane_device_title"),
             self.device_table_view,
             self.device_tree_widget,
             self._toggle_check_all_device,
+        )
+        self.device_search_edit.textChanged.connect(
+            lambda text: self._apply_search_filter(text, self.device_proxy_model, self.device_tree_widget)
         )
         self.device_stats_label = QLabel()
         self.device_stats_separator = QLabel("|")
@@ -483,11 +508,18 @@ class MainWindow(QMainWindow):
 
     def _build_pane(
         self, title: str, table_view: QTableView, tree_widget: QTreeWidget, toggle_check_all_handler
-    ) -> tuple[QWidget, QPushButton]:
+    ) -> tuple[QWidget, QPushButton, QLineEdit]:
         pane = QWidget()
         pane_layout = QVBoxLayout(pane)
         pane_layout.setContentsMargins(0, 0, 0, 0)
         pane_layout.addWidget(QLabel(f"<b>{title}</b>"), 0)
+
+        search_edit = QLineEdit()
+        search_edit.setPlaceholderText(tr("search_placeholder"))
+        # The built-in clear button is the only affordance here: filtering is
+        # live on every keystroke, so there is no button to press to search.
+        search_edit.setClearButtonEnabled(True)
+        pane_layout.addWidget(search_edit, 0)
 
         tabs = QTabWidget()
         tabs.addTab(table_view, tr("tab_table"))
@@ -503,18 +535,21 @@ class MainWindow(QMainWindow):
         check_all_btn.clicked.connect(toggle_check_all_handler)
         check_row.addWidget(check_all_btn)
         pane_layout.addLayout(check_row)
-        return pane, check_all_btn
+        return pane, check_all_btn, search_edit
 
     def _build_table_view(self, presence_label: str, checked_hashes: set[str], on_check_changed) -> QTableView:
         view = QTableView()
         model = TrackTableModel(presence_label=presence_label, checked_hashes=checked_hashes, on_check_changed=on_check_changed)
-        proxy_model = QSortFilterProxyModel()
+        proxy_model = TrackFilterProxyModel()
         proxy_model.setSourceModel(model)
         # Sort by the raw value each column's data() returns under
         # Qt.UserRole (numbers as numbers, text through polish_sort_key)
         # instead of the proxy's default of comparing the formatted
         # DisplayRole strings shown in the cells.
         proxy_model.setSortRole(Qt.UserRole)
+        # Matching against every column (title, artist, album, format...) is
+        # handled by TrackFilterProxyModel itself, so none of Qt's own
+        # filter-column/case settings apply here.
         view.setModel(proxy_model)
         view.setSortingEnabled(True)
         view.setColumnWidth(0, 28)
@@ -551,6 +586,10 @@ class MainWindow(QMainWindow):
 
     def _build_tree_widget(self, context_menu_handler, double_click_handler) -> QTreeWidget:
         tree = QTreeWidget()
+        # Ctrl/Shift multi-selection, matching what the table views already
+        # do. This is plain item selection -- the per-track checkboxes are a
+        # separate thing entirely (they drive syncing, not editing).
+        tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         tree.setHeaderLabels([tr("tree_header_name"), tr("tree_header_year"), tr("tree_header_format")])
         tree.setContextMenuPolicy(Qt.CustomContextMenu)
         tree.customContextMenuRequested.connect(context_menu_handler)
@@ -704,9 +743,61 @@ class MainWindow(QMainWindow):
     def _update_check_all_button(button: QPushButton, table_model: TrackTableModel):
         button.setText(tr("btn_uncheck_all") if table_model.all_checked() else tr("btn_check_all"))
 
+    @staticmethod
+    def _tree_node_key(item: QTreeWidgetItem) -> tuple | None:
+        """Identity of an artist/album node that survives a rebuild. The
+        QTreeWidgetItem objects themselves don't -- _populate_tree drops and
+        recreates every one of them -- so expansion state has to be keyed by
+        the names the node stands for instead."""
+        data = item.data(0, Qt.UserRole) or {}
+        if data.get("type") == "artist":
+            return ("artist", data.get("artist"))
+        if data.get("type") == "album":
+            return ("album", data.get("artist"), data.get("album"))
+        return None
+
+    def _tree_expansion_state(self, tree_widget: QTreeWidget) -> tuple[set, set]:
+        """(keys of every artist/album node present, keys of the expanded
+        ones). Both halves matter on restore: a node that's missing from the
+        first set is new (a rename, or a freshly scanned album) and gets the
+        default state, while a known node absent from the second was
+        deliberately collapsed by the user and must stay that way."""
+        known: set = set()
+        expanded: set = set()
+        for i in range(tree_widget.topLevelItemCount()):
+            artist_item = tree_widget.topLevelItem(i)
+            for item in (artist_item, *(artist_item.child(j) for j in range(artist_item.childCount()))):
+                key = self._tree_node_key(item)
+                if key is None:
+                    continue
+                known.add(key)
+                if item.isExpanded():
+                    expanded.add(key)
+        return known, expanded
+
+    def _restore_tree_expansion(self, tree_widget: QTreeWidget, known: set, expanded: set):
+        for i in range(tree_widget.topLevelItemCount()):
+            artist_item = tree_widget.topLevelItem(i)
+            for depth, item in (
+                (0, artist_item),
+                *((1, artist_item.child(j)) for j in range(artist_item.childCount())),
+            ):
+                key = self._tree_node_key(item)
+                # Default for a node we've never seen matches what
+                # expandToDepth(0) does: artists open, albums closed.
+                item.setExpanded(key in expanded if key in known else depth == 0)
+
     def _populate_tree(
         self, tree_widget: QTreeWidget, tracks: list[Track], other_hashes: set[str], checked_hashes: set[str]
     ):
+        # Saving tags rebuilds the tree from scratch; without carrying the
+        # user's collapsed artists/albums (and scroll position) across that
+        # rebuild, every save snaps the view back to the default layout and
+        # loses their place in a large library.
+        known_nodes, expanded_nodes = self._tree_expansion_state(tree_widget)
+        had_content = tree_widget.topLevelItemCount() > 0
+        scroll_position = tree_widget.verticalScrollBar().value()
+
         self._updating_checks = True
         try:
             tree_widget.clear()
@@ -719,12 +810,14 @@ class MainWindow(QMainWindow):
             for artist in sorted(by_artist, key=polish_sort_key):
                 artist_item = QTreeWidgetItem([artist])
                 artist_item.setData(0, Qt.UserRole, {"type": "artist", "artist": artist})
+                artist_item.setData(0, SEARCH_TEXT_ROLE, artist.lower())
                 artist_item.setFlags(artist_item.flags() | Qt.ItemIsUserCheckable)
                 artist_present_flags = []
                 artist_checked_flags = []
                 for album in sorted(by_artist[artist], key=polish_sort_key):
                     album_item = QTreeWidgetItem([album])
                     album_item.setData(0, Qt.UserRole, {"type": "album", "artist": artist, "album": album})
+                    album_item.setData(0, SEARCH_TEXT_ROLE, album.lower())
                     album_item.setFlags(album_item.flags() | Qt.ItemIsUserCheckable)
                     album_present_flags = []
                     album_checked_flags = []
@@ -736,6 +829,7 @@ class MainWindow(QMainWindow):
                         )
                         track_item = QTreeWidgetItem([label, track.year, track.format])
                         track_item.setData(0, Qt.UserRole, {"type": "track", "track": track})
+                        track_item.setData(0, SEARCH_TEXT_ROLE, label.lower())
                         track_item.setFlags(track_item.flags() | Qt.ItemIsUserCheckable)
                         checked = track.hash in checked_hashes
                         track_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
@@ -754,9 +848,138 @@ class MainWindow(QMainWindow):
                 self._set_presence_icon(artist_item, artist_present_flags)
                 tree_widget.addTopLevelItem(artist_item)
 
-            tree_widget.expandToDepth(0)
+            if had_content:
+                self._restore_tree_expansion(tree_widget, known_nodes, expanded_nodes)
+            else:
+                tree_widget.expandToDepth(0)
         finally:
             self._updating_checks = False
+
+        if had_content:
+            tree_widget.verticalScrollBar().setValue(scroll_position)
+
+        # The rebuild dropped every item, hidden flags included, so an active
+        # search has to be re-applied or a save would silently un-filter the
+        # tree while the search box still shows the query.
+        filter_text = self._tree_filter_text.get(tree_widget, "")
+        if filter_text:
+            self._filter_tree(tree_widget, filter_text)
+
+    def _apply_search_filter(self, text: str, proxy_model: TrackFilterProxyModel, tree_widget: QTreeWidget):
+        """Queue a filter of a pane's table and tree down to tracks matching
+        `text`. Wired to textChanged -- no Enter, no button.
+
+        Debounced rather than run inline: re-filtering re-sorts the whole
+        table and walks the whole tree, and doing that once per keystroke
+        meant a fast typist queued up a run per character and the box lagged
+        behind their typing. Restarting the timer collapses a burst of
+        keystrokes into the single filter pass that matters -- the one for
+        the text they stopped on."""
+        timer = self._search_debounce.get(tree_widget)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(SEARCH_DEBOUNCE_MS)
+            timer.timeout.connect(lambda tw=tree_widget: self._run_search_filter(tw))
+            self._search_debounce[tree_widget] = timer
+        self._pending_filter_text[tree_widget] = (text, proxy_model)
+        timer.start()
+
+    def _run_search_filter(self, tree_widget: QTreeWidget):
+        pending = self._pending_filter_text.pop(tree_widget, None)
+        if pending is None:
+            return
+        text, proxy_model = pending
+        proxy_model.set_filter_text(text)
+        previous = self._tree_filter_text.get(tree_widget, "")
+        self._tree_filter_text[tree_widget] = text
+        self._filter_tree(tree_widget, text, previous)
+
+    def _filter_tree(self, tree_widget: QTreeWidget, text: str, previous: str = ""):
+        """Hide every tree node that doesn't match `text`.
+
+        `previous` is the query this one replaces. When the new query merely
+        extends it ("bea" -> "beat"), a node that was already hidden can't
+        come back -- a longer needle matches a subset of what the shorter one
+        did -- so whole hidden subtrees are skipped instead of re-tested.
+        That turns the common case (typing another character) into work
+        proportional to what's still on screen rather than to the library."""
+        needle = text.strip().lower()
+        if not needle:
+            for artist_item, album_item, track_item in self._tree_nodes(tree_widget):
+                (track_item or album_item or artist_item).setHidden(False)
+            saved = self._tree_prefilter_state.pop(tree_widget, None)
+            if saved:
+                self._restore_tree_expansion(tree_widget, *saved)
+            return
+
+        # Snapshot the pre-filter shape once, on the keystroke that starts a
+        # search -- matches get their parents force-expanded below, which
+        # would otherwise overwrite what the user had collapsed.
+        if tree_widget not in self._tree_prefilter_state:
+            self._tree_prefilter_state[tree_widget] = self._tree_expansion_state(tree_widget)
+
+        narrowing = bool(previous) and needle.startswith(previous.strip().lower())
+
+        # One repaint at the end instead of one per setHidden/setExpanded:
+        # without this the view relayouts thousands of times mid-walk.
+        tree_widget.setUpdatesEnabled(False)
+        try:
+            for i in range(tree_widget.topLevelItemCount()):
+                artist_item = tree_widget.topLevelItem(i)
+                if narrowing and artist_item.isHidden():
+                    continue
+                artist_hit = needle in self._search_text(artist_item)
+                artist_visible = False
+                for j in range(artist_item.childCount()):
+                    album_item = artist_item.child(j)
+                    if narrowing and album_item.isHidden():
+                        continue
+                    album_hit = artist_hit or needle in self._search_text(album_item)
+                    album_visible = False
+                    for k in range(album_item.childCount()):
+                        track_item = album_item.child(k)
+                        if narrowing and track_item.isHidden():
+                            continue
+                        # A hit on the artist or album shows everything under
+                        # it: searching for a band means wanting its records,
+                        # not only the tracks whose titles repeat the band's
+                        # name.
+                        visible = album_hit or needle in self._search_text(track_item)
+                        track_item.setHidden(not visible)
+                        album_visible = album_visible or visible
+                    album_item.setHidden(not album_visible)
+                    album_item.setExpanded(album_visible)
+                    artist_visible = artist_visible or album_visible
+                artist_item.setHidden(not artist_visible)
+                artist_item.setExpanded(artist_visible)
+        finally:
+            tree_widget.setUpdatesEnabled(True)
+
+    @staticmethod
+    def _search_text(item: QTreeWidgetItem) -> str:
+        """The item's label, lowercased. _populate_tree stashes this on every
+        node it builds, because re-lowercasing every label on every keystroke
+        was a large share of the filter's cost on a big tree. Computed on the
+        spot for any node that somehow lacks it -- writing it back here would
+        emit itemChanged in the middle of the filter walk, which the check
+        propagation in _on_tree_item_changed would pick up."""
+        cached = item.data(0, SEARCH_TEXT_ROLE)
+        return item.text(0).lower() if cached is None else cached
+
+    @staticmethod
+    def _tree_nodes(tree_widget: QTreeWidget):
+        """Every (artist, album, track) node in the tree, one row per node --
+        the two shallower entries are None on deeper rows, so callers can
+        pick out the level they care about."""
+        for i in range(tree_widget.topLevelItemCount()):
+            artist_item = tree_widget.topLevelItem(i)
+            yield artist_item, None, None
+            for j in range(artist_item.childCount()):
+                album_item = artist_item.child(j)
+                yield artist_item, album_item, None
+                for k in range(album_item.childCount()):
+                    yield artist_item, album_item, album_item.child(k)
 
     def _aggregate_check_state(self, flags: list[bool]) -> Qt.CheckState:
         if flags and all(flags):
@@ -1218,6 +1441,64 @@ class MainWindow(QMainWindow):
                         tracks.append(data["track"])
         return tracks
 
+    def _selected_tree_tracks(self, tree_widget: QTreeWidget) -> list[Track]:
+        """Tracks covered by the current selection, in the order they appear
+        in the tree. A selected album or artist node stands for everything
+        beneath it, so selecting an album plus one of its tracks yields that
+        album once rather than a duplicated track. Hidden nodes are skipped:
+        a selection made before typing in the search box must not drag in
+        rows the user can no longer see."""
+        selected: list[Track] = []
+        seen: set[str] = set()
+        for artist_item, album_item, track_item in self._tree_nodes(tree_widget):
+            if track_item is None or track_item.isHidden() or album_item.isHidden() or artist_item.isHidden():
+                continue
+            if not (track_item.isSelected() or album_item.isSelected() or artist_item.isSelected()):
+                continue
+            track = (track_item.data(0, Qt.UserRole) or {}).get("track")
+            if track is not None and track.path not in seen:
+                seen.add(track.path)
+                selected.append(track)
+        return selected
+
+    @staticmethod
+    def _selected_table_tracks(view: QTableView, proxy_model, table_model) -> list[Track]:
+        rows = sorted(view.selectionModel().selectedRows(), key=lambda index: index.row())
+        return [table_model.track_at(proxy_model.mapToSource(index).row()) for index in rows]
+
+    def _edit_tracks_as_album(self, tracks: list[Track]):
+        """Edit a loose multi-selection through the album dialog: it offers
+        exactly the fields that make sense to apply to several tracks at
+        once (artist, album, year, genre, cover), and none of the per-track
+        ones (title, track number) that would overwrite each file with the
+        same value."""
+        if not self.source_root or not self.library_db or not tracks:
+            return
+        dialog = AlbumEditDialog(
+            self.source_root,
+            [list(tracks)],
+            0,
+            on_saved=self._persist_track_edit,
+            settings=self.settings,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_views()
+
+    def _edit_device_tracks_as_album(self, tracks: list[Track]):
+        if not self.selected_device or not self.device_db or not tracks:
+            return
+        dialog = AlbumEditDialog(
+            Path(self.selected_device.mountpoint),
+            [list(tracks)],
+            0,
+            on_saved=self._persist_device_track_edit,
+            settings=self.settings,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_views()
+
     def _edit_selected_table_track(self, proxy_index):
         tracks = self._table_ordered_tracks()
         self._edit_track_sequence(tracks, proxy_index.row())
@@ -1402,7 +1683,13 @@ class MainWindow(QMainWindow):
             return
         tracks = self._table_ordered_tracks()
         track = tracks[index.row()]
-        self._show_track_menu(track, tracks, index.row(), self.table_view.viewport().mapToGlobal(pos))
+        self._show_track_menu(
+            track,
+            tracks,
+            index.row(),
+            self.table_view.viewport().mapToGlobal(pos),
+            self._selected_table_tracks(self.table_view, self.proxy_model, self.table_model),
+        )
 
     def _tree_context_menu(self, pos):
         item = self.tree_widget.itemAt(pos)
@@ -1416,7 +1703,7 @@ class MainWindow(QMainWindow):
             tracks = self._flatten_tree_tracks()
             track = data["track"]
             index = tracks.index(track) if track in tracks else 0
-            self._show_track_menu(track, tracks, index, global_pos)
+            self._show_track_menu(track, tracks, index, global_pos, self._selected_tree_tracks(self.tree_widget))
         elif item_type == "album":
             self._show_album_menu(global_pos, data["artist"], data["album"])
         elif item_type == "artist":
@@ -1429,7 +1716,13 @@ class MainWindow(QMainWindow):
         tracks = self._device_table_ordered_tracks()
         source_row = self.device_proxy_model.mapToSource(self.device_proxy_model.index(index.row(), 0)).row()
         track = self.device_table_model.track_at(source_row)
-        self._show_device_track_menu(track, tracks, index.row(), self.device_table_view.viewport().mapToGlobal(pos))
+        self._show_device_track_menu(
+            track,
+            tracks,
+            index.row(),
+            self.device_table_view.viewport().mapToGlobal(pos),
+            self._selected_table_tracks(self.device_table_view, self.device_proxy_model, self.device_table_model),
+        )
 
     def _device_tree_context_menu(self, pos):
         item = self.device_tree_widget.itemAt(pos)
@@ -1443,19 +1736,26 @@ class MainWindow(QMainWindow):
             tracks = self._flatten_device_tree_tracks()
             track = data["track"]
             index = tracks.index(track) if track in tracks else 0
-            self._show_device_track_menu(track, tracks, index, global_pos)
+            self._show_device_track_menu(
+                track, tracks, index, global_pos, self._selected_tree_tracks(self.device_tree_widget)
+            )
         elif item_type == "album":
             self._show_device_album_menu(global_pos, data["artist"], data["album"])
         elif item_type == "artist":
             self._show_device_artist_menu(global_pos, data["artist"])
 
-    def _show_device_track_menu(self, device_track: Track, tracks: list[Track], index: int, global_pos):
+    def _show_device_track_menu(self, device_track: Track, tracks: list[Track], index: int, global_pos, selected: list[Track] | None = None):
         menu = QMenu(self)
+        multi_edit_action = None
+        if selected and len(selected) > 1 and any(t.path == device_track.path for t in selected):
+            multi_edit_action = menu.addAction(tr("menu_edit_selected_tags", count=len(selected)))
         edit_action = menu.addAction(tr("menu_edit_tags"))
         media_info_action = menu.addAction(tr("menu_media_info"))
         delete_action = menu.addAction(tr("menu_delete_from_device"))
         action = menu.exec(global_pos)
-        if action == edit_action:
+        if multi_edit_action and action == multi_edit_action:
+            self._edit_device_tracks_as_album(selected)
+        elif action == edit_action:
             self._edit_device_track_sequence(tracks, index)
         elif action == media_info_action:
             self._show_media_info(device_track, from_device=True)
@@ -1492,8 +1792,14 @@ class MainWindow(QMainWindow):
 
         self._delete_device_tracks([device_track])
 
-    def _show_track_menu(self, track: Track, tracks: list[Track], index: int, global_pos):
+    def _show_track_menu(self, track: Track, tracks: list[Track], index: int, global_pos, selected: list[Track] | None = None):
         menu = QMenu(self)
+        # Offered only when the right-clicked track is itself part of a
+        # multi-track selection -- right-clicking outside the selection is a
+        # gesture about that one row, not about what's highlighted elsewhere.
+        multi_edit_action = None
+        if selected and len(selected) > 1 and any(t.path == track.path for t in selected):
+            multi_edit_action = menu.addAction(tr("menu_edit_selected_tags", count=len(selected)))
         edit_action = menu.addAction(tr("menu_edit_tags"))
         media_info_action = menu.addAction(tr("menu_media_info"))
         sync_action = menu.addAction(tr("menu_sync_track"))
@@ -1503,7 +1809,9 @@ class MainWindow(QMainWindow):
         delete_action = menu.addAction(tr("menu_delete_track"))
 
         action = menu.exec(global_pos)
-        if action == edit_action:
+        if multi_edit_action and action == multi_edit_action:
+            self._edit_tracks_as_album(selected)
+        elif action == edit_action:
             self._edit_track_sequence(tracks, index)
         elif action == media_info_action:
             self._show_media_info(track, from_device=False)

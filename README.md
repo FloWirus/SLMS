@@ -10,12 +10,15 @@ A simple Linux desktop app (PySide6) for cataloguing a local music library, edit
 - Incremental rescans: unchanged files (same size + modification time) are skipped, so only new/changed files are re-hashed.
 - Supported audio formats: mp3, flac, ogg, wav, m4a, aac, wma.
 - Table view (sortable by artist, album, disc number, title, track number, tracks-in-album, year, genre, format, size) and tree view (artist → album → track). Column widths, order, and visibility are remembered per view (table/tree, library/device) and restored on next launch.
+- A search box above each panel filters that side live as you type, driving the table and the tree at once. It matches every column the table shows (artist, album, title, genre, format, year, track/disc numbers, size); in the tree, a hit on an artist or album keeps everything beneath it visible, so searching for a band gives you its whole discography rather than only the tracks whose titles repeat the band's name. Matching branches expand themselves, and clearing the box puts the tree back exactly as you had it — including which artists/albums you had collapsed.
 - Checkboxes on both the table and tree view let you build a selection of tracks to sync; checking/unchecking is shared and kept in sync between the two views (checking an artist/album cascades to its tracks), with a "Check all"/"Uncheck all" toggle button per pane. When any tracks are checked, the toolbar Sync button for that pane syncs just that selection instead of everything.
 - The tree view marks presence on the other side with a check icon: full green check when every track under an artist/album is present, a muted grey check when only some are.
 - Edit tags (artist, album, title, track number, tracks-in-album, disc number, year, genre) and cover art per track, or for a whole album at once (artist, album, year, genre, tracks-in-album, cover — title/track number stay untouched). Available on both the library and device side (double-click a track, or use the context menu on a track/album) — device-side edits only touch the copy on the device, never the library file.
+- Edit any hand-picked set of tracks at once: select several rows (Ctrl/Shift) in the table or the tree and pick "Edit tags of N selected tracks…" from the context menu. Fields the selected tracks all agree on show that one value; fields that differ show each track's own value in tree order, `;`-separated — so you can retarget a single file by editing its segment, or apply one value to every selected track by replacing the whole list with it.
 - A "More tags…" toggle in both editors widens the window and adds a panel with every further tag mutagen can actually write for that file's format — composer, conductor, lyricist, comment, mood, BPM, ISRC, and more for a single track; release-level ones like album artist, label, catalog number, barcode, or compilation for a whole album (the same track-vs-album split as the basic fields). A field the format can't support is left out rather than offered and failing on save (e.g. MP3 has no plain "comment" tag; M4A/AAC supports only a handful of these to begin with) — FLAC/OGG accept the full set, since Vorbis Comment tags are freeform. Saving applies the basic fields, extended tags, cover, and filename together in one pass.
 - Edit the filename directly from the tag editor.
 - Manually picking a cover in the tag/album editor stores it as-is (no automatic resizing) — the library can hold covers at any resolution.
+- "Download from Tidal…" in both the track and the album editor fetches album art from Tidal's public search API — no account or token of your own needed. Rather than trusting result order, candidates are re-ranked against the artist/album you actually typed, every credited artist is scored (so collaborations and duet albums, which Tidal files under a single lead artist, aren't dismissed as wrong-artist hits), and several regional catalogues are queried and pooled, since Tidal only returns albums licensed in the region asked for. What it finds is shown side by side with the cover you already have, each with its real pixel dimensions, so you can compare before replacing anything. A cover accepted from Tidal is also written out next to the album as `cover.jpg`; a cover you picked manually from disk is not, since that file already exists wherever you chose it from.
 - Next/Previous navigation while editing: track editor moves across all tracks (crossing album/artist boundaries); album editor moves between whole albums.
 - Detects mounted removable storage devices (via `lsblk`) and lets you pick a sync target from a dropdown. Selecting/reconnecting a device automatically rescans it against what's actually on disk, so files deleted manually (outside the app) since the last connection are correctly detected as missing instead of still showing as present. "Refresh devices" re-lists what's currently plugged in without rescanning a device that's already selected; "Scan device" forces a full rescan on demand.
 - Both panels show a live count of distinct artists, albums and tracks currently listed (library or device) right under the file list. The device panel additionally shows how much free space is left on it: a compact bar plus the exact free/total figures next to it.
@@ -81,16 +84,19 @@ music_sync/
   cover_utils.py              cover image resizing/re-encoding (used at sync time only)
   cover_cache.py              persistent resized-cover cache (covers.db + [Covers] folders in the library)
   album_covers.py             loose album cover (cover.jpg/folder.png/...) discovery, read in place as a resize source
+  tidal_cover.py              Tidal cover art lookup (public search API, multi-region pooling, candidate re-ranking)
   sync.py                     two-way sync logic, conflict handling, conversion/cover-resize wiring, atomic device writes
   settings.py                 persisted app settings
   i18n.py                     EN/PL translations
   gui/
-    main_window.py            main window, table/tree views, menus, checked-selection sync, convert/resize/profile bars, deletion
-    models.py                 table model
+    main_window.py            main window, table/tree views, live search filtering, menus, checked-selection sync, convert/resize/profile bars, deletion
+    models.py                 table model, sort keys, search filter proxy
     icons.py                  hand-drawn checkbox/presence icons
     tag_edit_dialog.py        single-track tag editor (Next/Previous)
     album_edit_dialog.py      album-wide tag editor (Next/Previous album)
     extended_tags_panel.py    inline "More tags" panel of format-specific extra tags, embedded in both editors above
+    tidal_cover_worker.py     background-thread wrapper around the Tidal lookup, so the dialog stays responsive
+    cover_compare_dialog.py   side-by-side "current vs. found on Tidal" cover comparison
     media_info_dialog.py      read-only technical info dialog (codec, sample rate, bitrate, ...)
     settings_dialog.py        templates, language, theme, libsoxr/TrackNoFix toggles
     theme.py                  light/dark/auto palette handling
@@ -108,12 +114,15 @@ Prosta aplikacja desktopowa na Linuksa (PySide6) do katalogowania lokalnej bibli
 - Inkrementalne ponowne skanowanie: niezmienione pliki (ten sam rozmiar i data modyfikacji) są pomijane — hashowane są tylko nowe/zmienione pliki.
 - Obsługiwane formaty audio: mp3, flac, ogg, wav, m4a, aac, wma.
 - Widok tabeli (sortowanie wg artysty, albumu, numeru płyty, tytułu, numeru utworu, liczby utworów w albumie, roku, gatunku, formatu, rozmiaru) oraz widok drzewa (artysta → album → utwór). Szerokość, kolejność i widoczność kolumn są zapamiętywane osobno dla każdego widoku (tabela/drzewo, biblioteka/nośnik) i przywracane przy następnym uruchomieniu.
+- Pole wyszukiwania nad każdym panelem filtruje daną stronę na żywo w trakcie pisania, sterując jednocześnie tabelą i drzewem. Dopasowuje wszystkie kolumny widoczne w tabeli (artysta, album, tytuł, gatunek, format, rok, numer utworu/płyty, rozmiar); w drzewie trafienie w artystę lub album zostawia widoczne wszystko, co pod nim leży — więc szukanie zespołu daje całą jego dyskografię, a nie tylko utwory, w których tytule powtarza się nazwa zespołu. Pasujące gałęzie rozwijają się same, a wyczyszczenie pola przywraca drzewo dokładnie w takim stanie, w jakim było — łącznie z tym, których artystów/albumów nie miałeś rozwiniętych.
 - Checkboxy zarówno w tabeli, jak i w drzewie pozwalają zbudować zaznaczenie utworów do synchronizacji; zaznaczanie/odznaczanie jest współdzielone i zsynchronizowane między obydwoma widokami (zaznaczenie artysty/albumu kaskadowo zaznacza jego utwory), z przyciskiem „Zaznacz/Odznacz wszystko” w każdym panelu. Gdy cokolwiek jest zaznaczone, przycisk „Synchronizuj” na pasku narzędzi dla danego panelu synchronizuje tylko to zaznaczenie zamiast wszystkiego.
 - Widok drzewa oznacza obecność po drugiej stronie ikoną „✓”: pełny zielony ✓, gdy wszystkie utwory artysty/albumu są obecne, wyszarzony ✓, gdy tylko część.
 - Edycja tagów (artysta, album, tytuł, numer utworu, liczba utworów w albumie, numer płyty, rok, gatunek) i okładki dla pojedynczego utworu lub dla całego albumu naraz (artysta, album, rok, gatunek, liczba utworów, okładka — tytuł i numer utworu pozostają nietknięte). Dostępne zarówno po stronie biblioteki, jak i nośnika (dwuklik na utworze albo menu kontekstowe utworu/albumu) — edycja po stronie nośnika dotyczy tylko kopii na nośniku, nigdy pliku w bibliotece.
+- Edycja dowolnie wybranego zestawu utworów naraz: zaznacz kilka wierszy (Ctrl/Shift) w tabeli albo w drzewie i wybierz z menu kontekstowego „Edytuj tagi zaznaczonych utworów (N)…”. Pola, w których wszystkie zaznaczone utwory się zgadzają, pokazują jedną wartość; pola, które się różnią, pokazują wartość każdego utworu w kolejności z drzewa, rozdzieloną znakiem `;` — dzięki temu można poprawić pojedynczy plik, edytując jego fragment, albo nadać jedną wartość wszystkim zaznaczonym, zastępując nią całą listę.
 - Przełącznik „Więcej tagów…” w obu edytorach poszerza okno i dodaje panel ze wszystkimi dalszymi tagami, jakie mutagen faktycznie potrafi zapisać dla danego formatu pliku — kompozytor, dyrygent, autor tekstu, komentarz, nastrój, BPM, ISRC i inne dla pojedynczego utworu; pola na poziomie wydania, jak artysta albumu, wytwórnia, numer katalogowy, kod kreskowy czy kompilacja dla całego albumu (ten sam podział utwór/album co w polach podstawowych). Pole, którego dany format nie obsługuje, jest pomijane zamiast oferowane i kończące się błędem przy zapisie (np. MP3 nie ma zwykłego tagu „comment”; M4A/AAC obsługuje tylko garstkę z tych pól) — FLAC/OGG przyjmują cały zestaw, bo tagi Vorbis Comment są dowolne. Zapis stosuje podstawowe pola, rozszerzone tagi, okładkę i nazwę pliku razem w jednym przebiegu.
 - Edycja nazwy pliku bezpośrednio z edytora tagów.
 - Ręczny wybór okładki w edytorze tagów/albumu zapisuje ją bez zmian (bez automatycznego skalowania) — biblioteka może trzymać okładki w dowolnej rozdzielczości.
+- „Pobierz z Tidal…” w edytorze utworu i albumu pobiera okładkę z publicznego API wyszukiwania Tidala — bez własnego konta ani tokenu. Zamiast ufać kolejności wyników, kandydaci są przeliczani względem faktycznie wpisanego artysty/albumu, punktowany jest każdy artysta wymieniony przy wydawnictwie (więc współprace i albumy duetów, które Tidal podpina pod jednego artystę wiodącego, nie są odrzucane jako trafienie w złego artystę), a odpytywanych i łączonych jest kilka katalogów regionalnych, bo Tidal zwraca tylko albumy licencjonowane w regionie, o który pytano. Znaleziona okładka jest pokazywana obok tej, którą już masz, każda z realnymi wymiarami w pikselach — można je porównać przed jakąkolwiek podmianą. Okładka przyjęta z Tidala jest dodatkowo zapisywana obok albumu jako `cover.jpg`; okładka wskazana ręcznie z dysku już nie, bo ten plik i tak leży tam, skąd go wybrałeś.
 - Nawigacja Następny/Poprzedni podczas edycji: edytor utworu przechodzi przez wszystkie utwory (także między albumami/artystami); edytor albumu przechodzi między całymi albumami.
 - Wykrywanie podłączonych nośników wymiennych (przez `lsblk`) i wybór celu synchronizacji z listy. Wybranie/ponowne podłączenie nośnika automatycznie skanuje go pod kątem faktycznej zawartości dysku, więc pliki usunięte ręcznie (poza aplikacją) od ostatniego podłączenia są poprawnie wykrywane jako brakujące, zamiast wciąż pokazywać się jako obecne. „Odśwież nośniki” tylko odświeża listę podłączonych nośników bez ponownego skanowania już wybranego; „Skanuj nośnik” wymusza pełne ponowne skanowanie na żądanie.
 - Oba panele pokazują na bieżąco liczbę artystów, albumów i utworów aktualnie widocznych na liście (w bibliotece lub na nośniku), tuż pod widokiem plików. Panel nośnika dodatkowo pokazuje ilość wolnego miejsca: skrócony pasek plus dokładne wartości wolne/całość obok niego.
@@ -179,16 +188,19 @@ music_sync/
   cover_utils.py              skalowanie/przekodowywanie okładek (używane tylko przy sync)
   cover_cache.py              trwały cache przeskalowanych okładek (covers.db + foldery [Covers] w bibliotece)
   album_covers.py             wykrywanie luźnej okładki albumu (cover.jpg/folder.png/...), odczyt w miejscu jako źródło do resize
+  tidal_cover.py              wyszukiwanie okładek w Tidalu (publiczne API, łączenie regionów, przeliczanie kandydatów)
   sync.py                     logika synchronizacji dwukierunkowej, konflikty, konwersja/resize okładek, atomowy zapis na nośnik
   settings.py                 zapisywane ustawienia aplikacji
   i18n.py                     tłumaczenia EN/PL
   gui/
-    main_window.py            okno główne, widoki tabeli/drzewa, menu, sync. zaznaczenia, paski konwersji/resize/profili, usuwanie
-    models.py                 model tabeli
+    main_window.py            okno główne, widoki tabeli/drzewa, filtrowanie wyszukiwarką, menu, sync. zaznaczenia, paski konwersji/resize/profili, usuwanie
+    models.py                 model tabeli, klucze sortowania, proxy filtrujące wyszukiwarki
     icons.py                  ręcznie rysowane ikony checkboxa/obecności
     tag_edit_dialog.py        edytor tagów pojedynczego utworu (Następny/Poprzedni)
     album_edit_dialog.py      edytor tagów albumu (Następny/Poprzedni album)
     extended_tags_panel.py    panel „Więcej tagów” z dodatkowymi tagami zależnymi od formatu, osadzany w obu edytorach powyżej
+    tidal_cover_worker.py     wątek w tle dla wyszukiwania w Tidalu, żeby okno pozostało responsywne
+    cover_compare_dialog.py   porównanie okładek obok siebie: obecna vs. znaleziona w Tidalu
     media_info_dialog.py      okno tylko-do-odczytu z danymi technicznymi (kodek, próbkowanie, bitrate, ...)
     settings_dialog.py        szablony, język, motyw, przełączniki libsoxr/TrackNoFix
     theme.py                  obsługa palety jasny/ciemny/auto

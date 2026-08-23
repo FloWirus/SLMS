@@ -1,4 +1,6 @@
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from functools import lru_cache
+
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
 
 from .. import tags as tagsmod
 from ..db import Track
@@ -56,6 +58,14 @@ _POLISH_LETTER_RANK = {
 }
 
 
+# Cached: the proxy model sorts through Qt.UserRole, and
+# QSortFilterProxyModel calls data() twice per comparison -- O(n log n)
+# calls per sort, with a fresh sort after every filter change. Computing
+# the key from scratch each time made typing in the search box crawl on a
+# few-thousand-track library. Artists/albums repeat heavily across rows, so
+# the cache hits hard; the bound keeps a huge library from growing it
+# without limit.
+@lru_cache(maxsize=100_000)
 def polish_sort_key(value: str) -> str:
     """Sort key placing Polish diacritic letters right after their base letter
     (a, \u0105, b, c, \u0107, ... l, \u0142, m, ... z, \u017a, \u017c) instead
@@ -116,11 +126,45 @@ class TrackTableModel(QAbstractTableModel):
         self._presence_label = presence_label
         self._checked_hashes: set[str] = checked_hashes if checked_hashes is not None else set()
         self._on_check_changed = on_check_changed
+        # Lazily built, one lowercase string per track, holding every field
+        # the search box looks at -- see haystack_at.
+        self._haystacks: list[str] | None = None
 
     def set_tracks(self, tracks: list[Track]) -> None:
         self.beginResetModel()
         self._tracks = tracks
+        self._haystacks = None
         self.endResetModel()
+
+    def haystack_at(self, row: int) -> str:
+        """Everything on a row that the search box matches against, as one
+        lowercase string. Built once for the whole table and reused across
+        keystrokes: TrackFilterProxyModel tests each row with a single
+        substring check instead of pulling and regex-matching twelve
+        per-column QVariants every time the query changes."""
+        if self._haystacks is None:
+            # Newline-joined, not space-joined: a QLineEdit can't contain a
+            # newline, so no query can span two fields. That keeps the old
+            # per-column matching semantics -- "beatles help" still has to
+            # occur inside a single field to count as a hit.
+            self._haystacks = [
+                "\n".join(
+                    (
+                        track.artist or "",
+                        track.album or "",
+                        track.title or "",
+                        track.genre or "",
+                        track.format or "",
+                        track.year or "",
+                        track.disc_number or "",
+                        tagsmod.fix_track_number(track.track_number) or "",
+                        track.track_total or "",
+                        format_size(track.size),
+                    )
+                ).lower()
+                for track in self._tracks
+            ]
+        return self._haystacks[row]
 
     def set_device_hashes(self, device_hashes: set[str]) -> None:
         self._device_hashes = device_hashes
@@ -201,3 +245,29 @@ class TrackTableModel(QAbstractTableModel):
             return polish_sort_key(str(getattr(track, key) or ""))
 
         return None
+
+
+class TrackFilterProxyModel(QSortFilterProxyModel):
+    """Search filter for the track tables.
+
+    Replaces setFilterFixedString + setFilterKeyColumn(-1), which made Qt
+    pull data() for all twelve columns of every row and run a regular
+    expression over each one on every keystroke. Here each row is matched
+    against a single pre-built lowercase haystack string (see
+    TrackTableModel.haystack_at) with a plain substring test."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._needle = ""
+
+    def set_filter_text(self, text: str) -> None:
+        needle = text.strip().lower()
+        if needle == self._needle:
+            return
+        self._needle = needle
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        if not self._needle:
+            return True
+        return self._needle in self.sourceModel().haystack_at(source_row)

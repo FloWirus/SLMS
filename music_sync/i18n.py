@@ -2,6 +2,8 @@ _current_language = "en"
 
 TRANSLATIONS = {
     "en": {
+        "search_placeholder": "Search tracks…",
+        "menu_edit_selected_tags": "Edit tags of {count} selected tracks…",
         "tab_table": "Table",
         "tab_tree": "Tree",
         "btn_check_all": "Check all",
@@ -265,6 +267,8 @@ TRANSLATIONS = {
         "log_deleted_from_device": "Deleted from device: {path}",
     },
     "pl": {
+        "search_placeholder": "Szukaj utworów…",
+        "menu_edit_selected_tags": "Edytuj tagi zaznaczonych utworów ({count})…",
         "tab_table": "Tabela",
         "tab_tree": "Drzewo",
         "btn_check_all": "Zaznacz wszystko",

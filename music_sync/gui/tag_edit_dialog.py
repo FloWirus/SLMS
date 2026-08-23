@@ -54,6 +54,11 @@ class TagEditDialog(QDialog):
         self.settings = settings
         self._new_cover_bytes: bytes | None = None
         self._new_cover_mime = "image/jpeg"
+        # Full-resolution copy of whatever the preview is showing.
+        # cover_label only ever holds a COVER_SIZE thumbnail, so reading the
+        # pixmap back off the label reports COVER_SIZE for every cover, no
+        # matter how large the artwork actually is.
+        self._cover_pixmap: QPixmap | None = None
         # Only covers fetched from Tidal are also written out as cover.jpg;
         # a manually picked file is left alone, since the user already has
         # that image on disk wherever they chose it from.
@@ -233,19 +238,30 @@ class TagEditDialog(QDialog):
         self.prev_btn.setEnabled(index > 0)
         self.next_btn.setEnabled(index < len(self.tracks) - 1)
 
+    def _show_cover_preview(self, pixmap: QPixmap | None):
+        """Put `pixmap` in the cover preview, keeping the unscaled original
+        on self. Everything that needs the artwork's real dimensions -- the
+        size label, the Tidal comparison -- has to read that copy rather
+        than cover_label's downscaled thumbnail."""
+        self._cover_pixmap = pixmap
+        if pixmap is None or pixmap.isNull():
+            self.cover_label.clear()
+            self.cover_label.setText(tr("cover_none"))
+            self.cover_size_label.clear()
+            return
+        self.cover_label.setPixmap(
+            pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
+
     def _load_cover_preview(self):
         data = tagsmod.read_cover_art(self.file_path)
         if data:
             pixmap = QPixmap()
             pixmap.loadFromData(data)
-            self.cover_label.setPixmap(
-                pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-            self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
+            self._show_cover_preview(pixmap)
         else:
-            self.cover_label.clear()
-            self.cover_label.setText(tr("cover_none"))
-            self.cover_size_label.clear()
+            self._show_cover_preview(None)
 
     def _choose_cover(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -260,10 +276,7 @@ class TagEditDialog(QDialog):
         self._new_cover_write_loose = False
         pixmap = QPixmap()
         pixmap.loadFromData(cover_bytes)
-        self.cover_label.setPixmap(
-            pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-        self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
+        self._show_cover_preview(pixmap)
 
     def _download_cover_from_tidal(self):
         artist = self.artist_edit.text().strip()
@@ -302,18 +315,14 @@ class TagEditDialog(QDialog):
         new_pixmap = QPixmap()
         new_pixmap.loadFromData(cover_bytes)
 
-        old_pixmap = self.cover_label.pixmap()
-        confirm = CoverCompareDialog(old_pixmap, new_pixmap, self)
+        confirm = CoverCompareDialog(self._cover_pixmap, new_pixmap, self)
         if confirm.exec() != QDialog.Accepted:
             return
 
         self._new_cover_bytes = cover_bytes
         self._new_cover_mime = mime
         self._new_cover_write_loose = True
-        self.cover_label.setPixmap(
-            new_pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-        self.cover_size_label.setText(f"{new_pixmap.width()}x{new_pixmap.height()}")
+        self._show_cover_preview(new_pixmap)
 
     def _current_fields(self) -> dict:
         return {
