@@ -1,6 +1,10 @@
 import json
+import logging
 import subprocess
 from dataclasses import dataclass
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,7 +29,17 @@ def list_storage_devices() -> list[StorageDevice]:
     except (subprocess.CalledProcessError, FileNotFoundError):
         return []
 
-    data = json.loads(output)
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        # An lsblk too old for -J (or one that printed a warning ahead of the
+        # JSON) must leave the app running with no devices listed, not take
+        # the window down with it.
+        logger.warning("lsblk did not return usable JSON; no devices listed")
+        return []
+    if not isinstance(data, dict):
+        return []
+
     devices: list[StorageDevice] = []
     for disk_node in data.get("blockdevices", []):
         _collect(disk_node, devices, disk_path=disk_node.get("path", ""))

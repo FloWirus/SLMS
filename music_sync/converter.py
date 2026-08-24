@@ -43,6 +43,23 @@ class CoverResizeSettings:
     dpi: int
 
 
+class ConversionFailed(subprocess.CalledProcessError):
+    """A failed ffmpeg run, carrying ffmpeg's own diagnosis.
+
+    Subclasses CalledProcessError so every existing `except
+    subprocess.CalledProcessError` still catches it -- the difference is
+    str(): the base class reports only "returned non-zero exit status 1",
+    which is what the sync result dialog used to show for every failed
+    conversion, with the one line that says *why* thrown away."""
+
+    def __str__(self) -> str:
+        detail = [line for line in (self.stderr or "").strip().splitlines() if line.strip()]
+        # ffmpeg puts the actual reason last, after the banner and the stream
+        # dump; a couple of lines is enough context without pasting a screen
+        # of build flags into a message box.
+        return f"{super().__str__()}: {' / '.join(detail[-2:])}" if detail else super().__str__()
+
+
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
@@ -119,4 +136,6 @@ def convert_file(source_path: Path, target_path: Path, spec: ConversionSpec, use
         cmd += ["-c:a", "libmp3lame", "-b:a", spec.bitrate, "-write_xing", "0", "-id3v2_version", "3"]
 
     cmd.append(str(target_path))
-    subprocess.run(cmd, check=True, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ConversionFailed(result.returncode, cmd, result.stdout, result.stderr)

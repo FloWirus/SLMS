@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 from .. import converter
 from ..i18n import available_languages, tr
 from ..settings import Settings
+from ..templating import validate_template
 
 
 class SettingsDialog(QDialog):
@@ -86,6 +87,15 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, tr("tag_help_title"), tr("tag_help_text"))
 
     def _on_save(self):
+        # Refused here rather than silently sanitized at sync time, so the
+        # user finds out that "/music/{artist}" or "../{artist}" isn't a
+        # valid target layout while they are still looking at the field.
+        for edit in (self.dir_template_edit, self.filename_template_edit):
+            error = validate_template(edit.text().strip())
+            if error:
+                QMessageBox.critical(self, tr("msg_template_invalid_title"), error)
+                edit.setFocus()
+                return
         if self.language_combo.currentData() != self._settings.language:
             QMessageBox.information(self, tr("dialog_title_settings"), tr("msg_restart_required"))
         self.accept()

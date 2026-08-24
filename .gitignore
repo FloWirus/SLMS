@@ -7,3 +7,4 @@ PROJECT.md
 dist/
 packaging/*
 !packaging/icon.png
+.pytest_cache/

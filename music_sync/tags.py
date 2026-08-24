@@ -1,7 +1,9 @@
+import base64
 from dataclasses import dataclass
 from pathlib import Path
 
 from mutagen import File as MutagenFile
+from mutagen.asf import ASF
 from mutagen.id3 import ID3, APIC, ID3NoHeaderError
 from mutagen.easyid3 import EasyID3
 from mutagen.mp3 import MP3
@@ -10,6 +12,8 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.easymp4 import EasyMP4, EasyMP4Tags
 from mutagen.wave import WAVE
+
+from .i18n import tr
 
 COMMON_FIELDS = ("artist", "album", "title", "track_number", "track_total", "disc_number", "year", "genre")
 
@@ -63,6 +67,90 @@ EXTENDED_FIELDS: tuple[ExtendedField, ...] = (
 _EASY_ID3_EXTENDED_KEYS = frozenset(k for k in EasyID3.valid_keys if "*" not in k)
 _EASY_MP4_EXTENDED_KEYS = frozenset(EasyMP4Tags.Get.keys())
 
+# ASF/WMA has no "easy" wrapper in mutagen, so this is the mapping the
+# _EasyASF adapter below uses to make a .wma file behave like every other
+# format here. Keys are the same plain names EasyID3/EasyMP4/Vorbis use;
+# values are the ASF attribute names Windows Media and every WMA-capable
+# player actually read.
+_ASF_KEY_MAP = {
+    "title": "Title",
+    "artist": "Author",
+    "album": "WM/AlbumTitle",
+    "date": "WM/Year",
+    "genre": "WM/Genre",
+    "tracknumber": "WM/TrackNumber",
+    "discnumber": "WM/PartOfSet",
+    "albumartist": "WM/AlbumArtist",
+    "composer": "WM/Composer",
+    "conductor": "WM/Conductor",
+    "lyricist": "WM/Writer",
+    "publisher": "WM/Publisher",
+    "organization": "WM/Publisher",
+    "copyright": "Copyright",
+    "comment": "Description",
+    "mood": "WM/Mood",
+    "bpm": "WM/BeatsPerMinute",
+    "isrc": "WM/ISRC",
+    "encodedby": "WM/EncodedBy",
+    "language": "WM/Language",
+    "barcode": "WM/Barcode",
+    "media": "WM/Media",
+    "grouping": "WM/ContentGroupDescription",
+}
+_ASF_EXTENDED_KEYS = frozenset(_ASF_KEY_MAP)
+
+
+class _EasyASF:
+    """Plain string key/value view over a .wma file's ASF attributes.
+
+    mutagen ships "easy" wrappers for MP3/MP4/Vorbis but not for ASF, so a
+    .wma file used to read as untagged (its keys are "Author", "WM/Year", ...
+    not "artist"/"date") and refuse to save at all -- despite .wma being in
+    AUDIO_EXTENSIONS and its files being scanned, listed and synced like any
+    other. This adapter maps the handful of names that matter (see
+    _ASF_KEY_MAP) so read_tags(), read_extended_tags() and
+    _apply_easy_fields() all work on WMA unchanged. Keys with no ASF
+    equivalent are ignored rather than raising: writing a tag the container
+    can't hold is not an error worth failing a save over."""
+
+    def __init__(self, path: Path):
+        self._path = Path(path)
+        self._asf = ASF(str(self._path))
+
+    def _attr(self, key: str) -> str | None:
+        return _ASF_KEY_MAP.get(key)
+
+    def get(self, key, default=None):
+        attr = self._attr(key)
+        if attr is None:
+            return default
+        values = self._asf.get(attr)
+        return [str(value) for value in values] if values else default
+
+    def __getitem__(self, key):
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __contains__(self, key) -> bool:
+        attr = self._attr(key)
+        return bool(attr and self._asf.get(attr))
+
+    def __setitem__(self, key, value) -> None:
+        attr = self._attr(key)
+        if attr is None:
+            return
+        self._asf[attr] = [value] if isinstance(value, str) else list(value)
+
+    def __delitem__(self, key) -> None:
+        attr = self._attr(key)
+        if attr is not None and attr in self._asf:
+            del self._asf[attr]
+
+    def save(self, *args) -> None:
+        self._asf.save()
+
 
 def editable_extended_fields(fmt: str, scope: str) -> list[ExtendedField]:
     """Extended fields (see EXTENDED_FIELDS) actually editable for the given
@@ -74,9 +162,14 @@ def editable_extended_fields(fmt: str, scope: str) -> list[ExtendedField]:
         supported = None  # Vorbis Comment: freeform, every key is valid.
     elif fmt in ("mp3", "wav"):
         supported = _EASY_ID3_EXTENDED_KEYS
-    elif fmt in ("m4a", "aac"):
+    elif fmt == "m4a":
         supported = _EASY_MP4_EXTENDED_KEYS
+    elif fmt == "wma":
+        supported = _ASF_EXTENDED_KEYS
     else:
+        # Includes .aac: raw ADTS streams have nowhere to put tags at all
+        # (mutagen: "doesn't support tags"), so offering fields for them
+        # would only produce failures at save time.
         return []
     return [f for f in EXTENDED_FIELDS if f.scope == scope and (supported is None or f.key in supported)]
 
@@ -104,9 +197,19 @@ def _open_easy(path: Path):
     None if it can't be opened. Used by both read_tags() and
     read_extended_tags() so .wav's special-casing (see _easy_wave) only
     lives in one place."""
+    suffix = path.suffix.lower()
     try:
-        if path.suffix.lower() == ".wav":
+        if suffix == ".wav":
             return _easy_wave(path)
+        if suffix == ".wma":
+            return _EasyASF(path)
+        if suffix == ".aac":
+            # ".aac" is usually a raw ADTS stream (no tag container at all),
+            # but the extension is also used for plain MP4/AAC files, which
+            # tag fine -- so try that and fall through to "no tags" instead
+            # of guessing from the extension.
+            audio = MutagenFile(str(path), easy=True)
+            return audio.tags if audio is not None else None
         audio = MutagenFile(str(path), easy=True)
     except Exception:
         return None
@@ -230,8 +333,21 @@ def write_tags(path: Path, fields: dict) -> None:
         audio = OggVorbis(str(path))
         _apply_easy_fields(audio, fields)
         audio.save()
-    elif ext in (".m4a", ".aac"):
+    elif ext == ".m4a":
         audio = EasyMP4(str(path))
+        _apply_easy_fields(audio, fields)
+        audio.save()
+    elif ext == ".aac":
+        # Only MP4-in-.aac can hold tags; a raw ADTS stream can not (see
+        # _open_easy), and mutagen says so by refusing to open it as MP4.
+        try:
+            audio = EasyMP4(str(path))
+        except Exception as exc:
+            raise ValueError(tr("error_unsupported_tag_format", ext=ext)) from exc
+        _apply_easy_fields(audio, fields)
+        audio.save()
+    elif ext == ".wma":
+        audio = _EasyASF(path)
         _apply_easy_fields(audio, fields)
         audio.save()
     elif ext == ".wav":
@@ -239,7 +355,7 @@ def write_tags(path: Path, fields: dict) -> None:
         _apply_easy_fields(audio, fields)
         audio.save(str(path))
     else:
-        raise ValueError(f"Nieobsługiwany format do edycji tagów: {ext}")
+        raise ValueError(tr("error_unsupported_tag_format", ext=ext))
 
 
 def _write_id3_easy(path: Path, fields: dict) -> None:
@@ -310,18 +426,35 @@ def sniff_image_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+# Vorbis Comment key holding a base64-encoded FLAC picture block. This is
+# how Ogg carries embedded artwork -- it has no picture block of its own the
+# way FLAC does, so the block is base64'd into an ordinary comment field.
+OGG_PICTURE_KEY = "metadata_block_picture"
+
+
+def _first_id3_cover(tags) -> bytes | None:
+    for tag in (tags or {}).values():
+        if isinstance(tag, APIC):
+            return tag.data
+    return None
+
+
 def read_cover_art(path: Path) -> bytes | None:
     ext = path.suffix.lower()
     try:
         if ext == ".mp3":
-            audio = ID3(str(path))
-            for tag in audio.values():
-                if isinstance(tag, APIC):
-                    return tag.data
-        elif ext == ".flac":
+            return _first_id3_cover(ID3(str(path)))
+        if ext == ".flac":
             audio = FLAC(str(path))
             if audio.pictures:
                 return audio.pictures[0].data
+        elif ext == ".ogg":
+            audio = OggVorbis(str(path))
+            encoded = audio.get(OGG_PICTURE_KEY)
+            if encoded:
+                return Picture(base64.b64decode(encoded[0])).data
+        elif ext == ".wav":
+            return _first_id3_cover(WAVE(str(path)).tags)
         elif ext in (".m4a", ".aac"):
             audio = MP4(str(path))
             covers = audio.get("covr")
@@ -351,10 +484,31 @@ def write_cover_art(path: Path, image_bytes: bytes, mime: str = "image/jpeg") ->
         pic.mime = mime
         audio.add_picture(pic)
         audio.save()
+    elif ext == ".ogg":
+        audio = OggVorbis(str(path))
+        picture = Picture()
+        picture.data = image_bytes
+        picture.type = 3
+        picture.mime = mime
+        audio[OGG_PICTURE_KEY] = [base64.b64encode(picture.write()).decode("ascii")]
+        audio.save()
+    elif ext == ".wav":
+        audio = WAVE(str(path))
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.delall("APIC")
+        audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=image_bytes))
+        audio.save()
     elif ext in (".m4a", ".aac"):
-        audio = MP4(str(path))
+        try:
+            audio = MP4(str(path))
+        except Exception as exc:
+            raise ValueError(tr("error_unsupported_cover_format", ext=ext)) from exc
         fmt = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
         audio["covr"] = [MP4Cover(image_bytes, imageformat=fmt)]
         audio.save()
     else:
-        raise ValueError(f"Nieobsługiwana edycja okładki dla formatu: {ext}")
+        # .wma is the remaining case: ASF stores artwork in a packed binary
+        # WM/Picture attribute that mutagen exposes only as raw bytes, so it
+        # is reported as unsupported rather than written half-correctly.
+        raise ValueError(tr("error_unsupported_cover_format", ext=ext))

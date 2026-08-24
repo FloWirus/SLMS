@@ -1,3 +1,7 @@
-PySide6>=6.11
-mutagen>=1.46
-requests>=2.31
+PySide6>=6.11,<7
+# Upper bound on purpose: tags._easy_wave reaches into EasyID3's private
+# __id3 attribute (mutagen exposes no supported way to bind an easy view to a
+# WAVE file's ID3 chunk), and tags._EasyASF depends on ASF's key names -- both
+# are things a major release is allowed to change under us.
+mutagen>=1.46,<2
+requests>=2.31,<3

@@ -13,11 +13,11 @@ from . import tags as tagsmod
 from .album_covers import read_loose_cover
 from .constants import AUDIO_EXTENSIONS
 from .converter import ConversionSettings, CoverResizeSettings, convert_file, decide_conversion
-from .cover_cache import CoverCache, covers_db_path, hash_cover
+from .cover_cache import CoverCache, hash_cover
 from .cover_utils import read_image_info, resize_cover_bytes
 from .db import MusicDatabase, Track, device_db_path
 from .i18n import tr
-from .scanner import hash_file, scan_directory
+from .scanner import hash_file
 from .templating import build_relative_target_path
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,17 @@ def _write_to_target_atomically(source: Path, target: Path) -> None:
     _fsync_dir(target.parent)
 
 
+def _is_present_on_target(path: Path) -> bool:
+    """Whether the target already holds a usable copy: the file exists and
+    isn't empty. Reads the size through one stat() with its own error
+    handling -- the card can be pulled between the check and the read, and an
+    OSError here is a "not present", not a failed sync."""
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _cleanup_stray_temp_files(root: Path) -> None:
     for stray in root.rglob(f"*{TARGET_TEMP_SUFFIX}"):
         try:
@@ -137,24 +148,29 @@ def sync_to_device(
 ) -> SyncResult:
     device_mountpoint = Path(device_mountpoint)
     device_db = MusicDatabase(device_db_path(device_mountpoint))
-    result = _copy_tracks(
-        source_root,
-        tracks,
-        device_mountpoint,
-        device_db,
-        dir_template,
-        filename_template,
-        on_conflict,
-        on_progress,
-        conversion,
-        cover_resize,
-        track_no_fix,
-        on_scan_progress,
-        force,
-        should_stop,
-    )
-    device_db.close()
-    return result
+    try:
+        return _copy_tracks(
+            source_root,
+            tracks,
+            device_mountpoint,
+            device_db,
+            dir_template,
+            filename_template,
+            on_conflict,
+            on_progress,
+            conversion,
+            cover_resize,
+            track_no_fix,
+            on_scan_progress,
+            force,
+            should_stop,
+        )
+    finally:
+        # In a finally, not after the call: a sync that dies half-way (a card
+        # pulled mid-copy) must still release the sqlite handle, or the next
+        # attempt opens a second connection to a database the first one still
+        # has open on removable media.
+        device_db.close()
 
 
 def sync_from_device(
@@ -207,10 +223,9 @@ def _copy_tracks(
 
     # Files can be deleted from the target outside the app; drop their stale
     # DB rows so they aren't mistaken for "already synced". Reports progress
-    # separately from on_progress since this scans the whole target, not the
-    # (usually smaller) list of tracks being synced — without this callback
-    # the GUI would sit unresponsive for however long this scan takes.
-    scan_directory(target_root, target_db, progress_callback=on_scan_progress, should_stop=should_stop)
+    # separately from on_progress since this walks the whole target database,
+    # not the (usually smaller) list of tracks being synced.
+    _prune_missing_targets(target_root, target_db, on_scan_progress, should_stop)
     if should_stop and should_stop():
         result.cancelled = True
         return result
@@ -219,120 +234,125 @@ def _copy_tracks(
     target_source_hashes = target_db.source_hashes()
 
     # Only relevant for PC -> device syncs (sync_from_device never passes
-    # cover_resize): resized cover output doesn't depend on the target, so
-    # the cache lives next to the PC library, keyed by source cover hash,
-    # and is shared across tracks/albums/repeat syncs/devices.
-    cover_cache = CoverCache(source_root, covers_db_path(source_root)) if cover_resize is not None else None
+    # cover_resize). Keyed by source cover hash and kept in the app's own
+    # data directory, so it is shared across tracks, albums, repeat syncs
+    # and devices -- see CoverCache.
+    cover_cache = CoverCache() if cover_resize is not None else None
     # Which cover to resize from is picked per album (best quality found
     # across all of the album's tracks' own tags plus any loose [Covers]
     # file), not just the one track currently being written -- cache that
     # choice so it's only computed once per album instead of once per track.
     best_album_cover = _LastAlbumCoverCache()
 
-    total = len(tracks)
-    for index, track in enumerate(tracks, start=1):
-        if should_stop and should_stop():
-            result.cancelled = True
-            break
+    try:
+        total = len(tracks)
+        for index, track in enumerate(tracks, start=1):
+            if should_stop and should_stop():
+                result.cancelled = True
+                break
 
-        if on_progress:
-            on_progress(index, total, track)
+            if on_progress:
+                on_progress(index, total, track)
 
-        if not force and track.hash in target_source_hashes:
-            existing_entry = target_db.get_by_source_hash(track.hash)
-            existing_path = target_root / existing_entry.path if existing_entry else None
-            if existing_entry and existing_path.exists() and existing_path.stat().st_size > 0:
-                result.already_present += 1
-                continue
-            # Registered but missing, or present as a zero-byte file (e.g.
-            # deleted mid-sync after the rescan above, or left truncated by a
-            # write that never made it to the device before it was removed):
-            # drop the stale row and fall through to re-copy.
-            target_source_hashes.discard(track.hash)
-            if existing_entry:
-                target_db.delete_by_path(existing_entry.path)
+            if not force and track.hash in target_source_hashes:
+                existing_entry = target_db.get_by_source_hash(track.hash)
+                if existing_entry and _is_present_on_target(target_root / existing_entry.path):
+                    result.already_present += 1
+                    continue
+                # Registered but missing, or present as a zero-byte file (e.g.
+                # deleted mid-sync after the rescan above, or left truncated by a
+                # write that never made it to the device before it was removed):
+                # drop the stale row and fall through to re-copy.
+                target_source_hashes.discard(track.hash)
+                if existing_entry:
+                    target_db.delete_by_path(existing_entry.path)
 
-        source_path = source_root / track.path
-        spec = decide_conversion(track, source_path, conversion.target_key) if conversion else None
+            source_path = source_root / track.path
+            spec = decide_conversion(track, source_path, conversion.target_key) if conversion else None
 
-        rel_target = build_relative_target_path(dir_template, filename_template, track)
-        if spec is not None:
-            rel_target = str(Path(rel_target).with_suffix(f".{spec.extension}"))
-        target_path = target_root / rel_target
+            rel_target = build_relative_target_path(dir_template, filename_template, track)
+            if spec is not None:
+                rel_target = str(Path(rel_target).with_suffix(f".{spec.extension}"))
+            target_path = target_root / rel_target
 
-        if target_path.exists() and not force:
-            existing_entry = target_db.get_by_path(rel_target)
-            if existing_entry and existing_entry.source_hash == track.hash:
+            if target_path.exists() and not force:
+                existing_entry = target_db.get_by_path(rel_target)
+                if existing_entry and existing_entry.source_hash == track.hash:
+                    target_source_hashes.add(track.hash)
+                    result.already_present += 1
+                    continue
+                resolution = on_conflict(track, target_path)
+                if resolution == ConflictResolution.SKIP:
+                    logger.info(tr("log_sync_skip_conflict", path=track.path))
+                    result.skipped += 1
+                    continue
+
+            needs_staging = spec is not None or cover_resize is not None or track_no_fix
+
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if needs_staging:
+                    # Do all mutation (convert / resize cover / fix track number) on a
+                    # temp file on local disk first -- these steps read-modify-write
+                    # the file repeatedly, and the device (SD card / MTP mount) has
+                    # much higher access latency than local SSD. Only the finished,
+                    # ready-to-go file is written to the device, in one streamed pass.
+                    with tempfile.TemporaryDirectory(prefix="music_sync_") as tmp_dir_name:
+                        file_format = spec.extension if spec is not None else track.format
+                        local_path = Path(tmp_dir_name) / f"staged.{file_format}"
+
+                        if spec is not None:
+                            convert_file(source_path, local_path, spec, conversion.use_libsoxr)
+                        else:
+                            shutil.copy2(source_path, local_path)
+
+                        cover_changed = (
+                            _resize_target_cover(local_path, cover_resize, cover_cache, source_path.parent, best_album_cover)
+                            if cover_resize is not None
+                            else False
+                        )
+                        track_no_fixed = _fix_target_track_number(local_path) if track_no_fix else False
+                        file_hash = (
+                            hash_file(local_path) if (spec is not None or cover_changed or track_no_fixed) else track.hash
+                        )
+
+                        _write_to_target_atomically(local_path, target_path)
+                else:
+                    _write_to_target_atomically(source_path, target_path)
+                    file_format = track.format
+                    file_hash = track.hash
+
+                target_stat = target_path.stat()
+
+                _register_track(
+                    target_db, track, rel_target, file_hash, track.hash, file_format, target_stat.st_size, target_stat.st_mtime
+                )
                 target_source_hashes.add(track.hash)
-                result.already_present += 1
-                continue
-            resolution = on_conflict(track, target_path)
-            if resolution == ConflictResolution.SKIP:
-                logger.info(tr("log_sync_skip_conflict", path=track.path))
-                result.skipped += 1
-                continue
+                result.copied += 1
+                logger.info(tr("log_sync_copied", index=index, total=total, source=track.path, target=rel_target))
 
-        needs_staging = spec is not None or cover_resize is not None or track_no_fix
+                # A dir/filename template change followed by a forced re-sync
+                # copies this track to its new rel_target above, but without
+                # this, its old copy under the previous template's path would
+                # never be removed -- force is meant to converge the device onto
+                # the current template, not accumulate one stale copy per past
+                # template. Best-effort and separate from the try/except above:
+                # a failure here must not be reported as the copy itself having
+                # failed, since it didn't.
+                if force:
+                    result.duplicates_removed += _remove_stale_duplicates(target_db, target_root, track.hash, rel_target)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                logger.error(tr("log_sync_copy_error", path=track.path, error=exc))
+                result.errors.append(f"{track.path}: {exc}")
 
-        try:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-
-            if needs_staging:
-                # Do all mutation (convert / resize cover / fix track number) on a
-                # temp file on local disk first -- these steps read-modify-write
-                # the file repeatedly, and the device (SD card / MTP mount) has
-                # much higher access latency than local SSD. Only the finished,
-                # ready-to-go file is written to the device, in one streamed pass.
-                with tempfile.TemporaryDirectory(prefix="music_sync_") as tmp_dir_name:
-                    file_format = spec.extension if spec is not None else track.format
-                    local_path = Path(tmp_dir_name) / f"staged.{file_format}"
-
-                    if spec is not None:
-                        convert_file(source_path, local_path, spec, conversion.use_libsoxr)
-                    else:
-                        shutil.copy2(source_path, local_path)
-
-                    cover_changed = (
-                        _resize_target_cover(local_path, cover_resize, cover_cache, source_path.parent, best_album_cover)
-                        if cover_resize is not None
-                        else False
-                    )
-                    track_no_fixed = _fix_target_track_number(local_path) if track_no_fix else False
-                    file_hash = (
-                        hash_file(local_path) if (spec is not None or cover_changed or track_no_fixed) else track.hash
-                    )
-
-                    _write_to_target_atomically(local_path, target_path)
-            else:
-                _write_to_target_atomically(source_path, target_path)
-                file_format = track.format
-                file_hash = track.hash
-
-            target_stat = target_path.stat()
-
-            _register_track(
-                target_db, track, rel_target, file_hash, track.hash, file_format, target_stat.st_size, target_stat.st_mtime
-            )
-            target_source_hashes.add(track.hash)
-            result.copied += 1
-            logger.info(tr("log_sync_copied", index=index, total=total, source=track.path, target=rel_target))
-
-            # A dir/filename template change followed by a forced re-sync
-            # copies this track to its new rel_target above, but without
-            # this, its old copy under the previous template's path would
-            # never be removed -- force is meant to converge the device onto
-            # the current template, not accumulate one stale copy per past
-            # template. Best-effort and separate from the try/except above:
-            # a failure here must not be reported as the copy itself having
-            # failed, since it didn't.
-            if force:
-                result.duplicates_removed += _remove_stale_duplicates(target_db, target_root, track.hash, rel_target)
-        except (OSError, subprocess.CalledProcessError) as exc:
-            logger.error(tr("log_sync_copy_error", path=track.path, error=exc))
-            result.errors.append(f"{track.path}: {exc}")
-
-    if cover_cache is not None:
-        cover_cache.close()
+    finally:
+        # In a finally so a raised error still releases the cache's sqlite
+        # handle -- the loop above touches removable media and file
+        # conversion, both of which can fail in ways the per-track
+        # try/except doesn't cover.
+        if cover_cache is not None:
+            cover_cache.close()
 
     logger.info(
         tr(
@@ -344,6 +364,40 @@ def _copy_tracks(
         )
     )
     return result
+
+
+def _prune_missing_targets(
+    target_root: Path,
+    target_db: MusicDatabase,
+    on_progress: ScanProgressCallback | None,
+    should_stop: ShouldStopCallback | None,
+) -> int:
+    """Drop rows for files that are no longer on the target, so they aren't
+    counted as "already synced".
+
+    Deliberately *not* a full scan_directory(): that re-hashes every file on
+    the card before a sync can start, which on a full SD card is minutes of
+    reading before the first byte is written -- and it is wasted, because
+    what the sync needs to know is only which registered files still exist.
+    Adopting files that appeared on the target by other means is the "Scan
+    device" button's job, not something every sync should pay for.
+    """
+    removed = 0
+    rows = target_db.all_tracks()
+    total = len(rows)
+    with target_db.batch():
+        for index, row in enumerate(rows, start=1):
+            if should_stop and should_stop():
+                break
+            path = target_root / row.path
+            if on_progress:
+                on_progress(index, total, path)
+            if not _is_present_on_target(path):
+                target_db.delete_by_path(row.path)
+                removed += 1
+    if removed:
+        logger.info(tr("log_sync_pruned_missing", count=removed))
+    return removed
 
 
 def _album_cover_quality(data: bytes) -> tuple[int, int] | None:
@@ -443,11 +497,15 @@ def _resize_target_cover(
         else:
             resized_bytes = resize_cover_bytes(cover_bytes, mime, cover_resize.max_size, cover_resize.dpi)
             if cover_cache is not None:
-                cover_cache.put(source_hash, cover_resize.max_size, cover_resize.dpi, mime, resized_bytes, album_dir)
+                cover_cache.put(source_hash, cover_resize.max_size, cover_resize.dpi, mime, resized_bytes)
 
         tagsmod.write_cover_art(target_path, resized_bytes, mime)
         return True
-    except Exception:
+    except Exception as exc:
+        # Still best-effort -- a cover that can't be resized must not fail the
+        # copy -- but logged, because silently shipping the original artwork
+        # for a whole library is exactly the kind of thing nobody notices.
+        logger.warning(tr("log_sync_cover_resize_failed", path=target_path, error=exc))
         return False
 
 
@@ -459,7 +517,8 @@ def _fix_target_track_number(target_path: Path) -> bool:
             return False
         tagsmod.write_tags(target_path, {"track_number": fixed, "track_total": current["track_total"]})
         return True
-    except Exception:
+    except Exception as exc:
+        logger.warning(tr("log_sync_track_no_fix_failed", path=target_path, error=exc))
         return False
 
 
@@ -483,6 +542,8 @@ def _register_track(
         album=track.album,
         title=track.title,
         track_number=track.track_number,
+        track_total=track.track_total,
+        disc_number=track.disc_number,
         year=track.year,
         genre=track.genre,
         format=file_format,

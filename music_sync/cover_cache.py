@@ -2,14 +2,24 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
-from .constants import DB_DIRNAME
+from .constants import app_data_dir
 
 COVERS_DB_FILENAME = "covers.db"
-COVERS_DIRNAME = "[Covers]"
+COVERS_DIRNAME = "covers"
 
 
-def covers_db_path(source_root: Path) -> Path:
-    return Path(source_root) / DB_DIRNAME / COVERS_DB_FILENAME
+def covers_dir() -> Path:
+    """Where resized cover art is cached.
+
+    Under the app's own data directory, not inside the music library. The
+    cache used to write a music_db/covers.db plus a "[Covers]/" folder into
+    every album directory it touched -- files the user never asked for, in a
+    library this app otherwise only reads from, and left behind for good once
+    the resize settings changed. Nothing about a resized cover depends on
+    where the source file lives (it is keyed by the artwork's own hash), so
+    it belongs with the app's data.
+    """
+    return app_data_dir() / COVERS_DIRNAME
 
 
 def hash_cover(cover_bytes: bytes) -> str:
@@ -17,28 +27,24 @@ def hash_cover(cover_bytes: bytes) -> str:
 
 
 class CoverCache:
-    """Persists resized cover art as files under `[Covers]/`, placed directly
-    inside whatever directory the source audio file actually lives in --
-    independent of the library's folder layout (artist/album, artist-album,
-    flat album folders, ...). Indexed by (raw cover hash, resize params) in a
-    small sqlite db kept alongside the PC library. Resizing the same artwork
-    -- across tracks in an album, repeat syncs, force-resync, or different
-    target devices -- is then a file read instead of a decode+resize.
+    """Resized cover art, cached as files under the app's data directory and
+    indexed by (raw cover hash, resize params) in a small sqlite database.
 
-    `[Covers]/` holds resize output and nothing else. Artwork the user put in
-    an album directory (cover.jpg, folder.png) is a *source*: it is read in
-    place by album_covers.read_loose_cover() and never moved, renamed or
-    deleted.
+    Resizing the same artwork again -- across the tracks of an album, repeat
+    syncs, a forced re-sync, or a second device -- then costs a file read
+    instead of a decode plus a rescale.
 
-    Lives on the PC library side only: resize output doesn't depend on the
-    sync target, and keeping it next to the source files means it survives
-    moving the whole library folder.
+    Keyed by the *source artwork's* hash, so the cache is equally valid for
+    every device and survives the library being moved or renamed. Artwork the
+    user put in an album directory (cover.jpg, folder.png) is a source: it is
+    read in place by album_covers.read_loose_cover() and never moved, renamed
+    or deleted.
     """
 
-    def __init__(self, source_root: Path, db_path: Path):
-        self.source_root = Path(source_root)
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, root: Path | None = None):
+        self.source_root = Path(root) if root is not None else covers_dir()
+        self.db_path = self.source_root / COVERS_DB_FILENAME
+        self.source_root.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.execute(
             """
@@ -72,11 +78,15 @@ class CoverCache:
             # recomputing rather than erroring the sync.
             return None
 
-    def put(self, source_hash: str, max_size: int, dpi: int, mime: str, resized_bytes: bytes, album_dir: Path) -> None:
-        covers_dir = Path(album_dir) / COVERS_DIRNAME
-        covers_dir.mkdir(parents=True, exist_ok=True)
+    def put(self, source_hash: str, max_size: int, dpi: int, mime: str, resized_bytes: bytes) -> None:
+        # Fanned out over one level of subdirectories named by the hash's
+        # first two characters: a large library resized at a couple of
+        # settings puts thousands of files here, and every file manager and
+        # filesystem is happier with 256 directories than one huge one.
+        bucket = self.source_root / source_hash[:2]
+        bucket.mkdir(parents=True, exist_ok=True)
         ext = "png" if mime == "image/png" else "jpg"
-        file_path = covers_dir / f"{source_hash[:16]}_{max_size}_{dpi}.{ext}"
+        file_path = bucket / f"{source_hash[:16]}_{max_size}_{dpi}.{ext}"
         file_path.write_bytes(resized_bytes)
         rel_path = file_path.relative_to(self.source_root)
         self.conn.execute(

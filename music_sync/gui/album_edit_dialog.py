@@ -1,12 +1,9 @@
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -17,30 +14,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import album_covers
 from .. import tags as tagsmod
-from ..cover_utils import normalize_manual_cover
 from ..db import Track
 from ..i18n import tr
 from ..settings import Settings
-from .cover_compare_dialog import CoverCompareDialog
-from .extended_tags_panel import PANEL_WIDTH as EXTENDED_PANEL_WIDTH
-from .extended_tags_panel import ExtendedTagsPanel
-from .tidal_cover_worker import TidalCoverWorker
+from .tag_dialog_base import CoverTagDialogBase
 
 # Separator between per-file values when a field isn't the same across the
 # edited tracks: "artist1;artist2;artist3". Editing one segment retargets
 # that one file; replacing the whole list with a single value applies it to
 # all of them (see _values_for_field).
 MULTI_VALUE_SEPARATOR = ";"
-COVER_SIZE = 150
 DIALOG_MIN_SIZE = (650, 480)
-TIDAL_COVER_SIZE = 1280
 
 OnSavedCallback = Callable[[Track, dict], Track | None]
 
 
-class AlbumEditDialog(QDialog):
+class AlbumEditDialog(CoverTagDialogBase):
     """Edits album-wide tags (artist, album, year, genre, track total, cover)
     for every track in an album at once. Per-track fields (title, track
     number, disc number) are left untouched. Next/Previous switch between
@@ -61,19 +51,6 @@ class AlbumEditDialog(QDialog):
         self.index = start_index
         self.on_saved = on_saved
         self.settings = settings
-        self._new_cover_bytes: bytes | None = None
-        self._new_cover_mime = "image/jpeg"
-        # Full-resolution copy of whatever the preview is showing.
-        # cover_label only ever holds a COVER_SIZE thumbnail, so reading the
-        # pixmap back off the label reports COVER_SIZE for every cover, no
-        # matter how large the artwork actually is.
-        self._cover_pixmap: QPixmap | None = None
-        # Only covers fetched from Tidal are also written out as cover.jpg;
-        # a manually picked file is left alone, since the user already has
-        # that image on disk wherever they chose it from.
-        self._new_cover_write_loose = False
-        self._tidal_thread: QThread | None = None
-        self._tidal_worker: TidalCoverWorker | None = None
 
         self._build_ui()
         self._load_index(self.index)
@@ -103,27 +80,7 @@ class AlbumEditDialog(QDialog):
 
         top_row = QHBoxLayout()
 
-        cover_box = QVBoxLayout()
-        self.cover_label = QLabel()
-        self.cover_label.setFixedSize(COVER_SIZE, COVER_SIZE)
-        self.cover_label.setStyleSheet("border: 1px solid gray;")
-        self.cover_label.setAlignment(Qt.AlignCenter)
-        cover_box.addWidget(self.cover_label)
-
-        self.cover_size_label = QLabel()
-        self.cover_size_label.setAlignment(Qt.AlignCenter)
-        cover_box.addWidget(self.cover_size_label)
-
-        cover_btn = QPushButton(tr("btn_change_cover"))
-        cover_btn.clicked.connect(self._choose_cover)
-        cover_box.addWidget(cover_btn)
-
-        self.tidal_cover_btn = QPushButton(tr("btn_download_cover_tidal"))
-        self.tidal_cover_btn.clicked.connect(self._download_cover_from_tidal)
-        cover_box.addWidget(self.tidal_cover_btn)
-
-        cover_box.addStretch(1)
-        top_row.addLayout(cover_box)
+        top_row.addLayout(self._build_cover_box())
 
         form_layout = QFormLayout()
         self.artist_edit = QLineEdit()
@@ -145,10 +102,7 @@ class AlbumEditDialog(QDialog):
         left_column.addWidget(self.info_label)
 
         action_row = QHBoxLayout()
-        self.more_tags_btn = QPushButton(tr("btn_more_tags"))
-        self.more_tags_btn.setCheckable(True)
-        self.more_tags_btn.toggled.connect(self._toggle_extended_panel)
-        action_row.addWidget(self.more_tags_btn)
+        action_row.addWidget(self._build_more_tags_button())
         left_column.addLayout(action_row)
 
         content_row.addLayout(left_column)
@@ -170,10 +124,9 @@ class AlbumEditDialog(QDialog):
         nav_row.addWidget(self.next_btn)
         main_layout.addLayout(nav_row)
 
-        # Matches the Next album button's width regardless of language/text
-        # length, per the request that this button look like a peer of the
-        # nav row.
-        self.more_tags_btn.setFixedWidth(self.next_btn.sizeHint().width())
+        # Wide enough for both of its captions, and never narrower than the
+        # Next album button beside it, so the two read as a pair.
+        self._lock_more_tags_button_width(self.next_btn)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText(tr("btn_save_close"))
@@ -189,46 +142,46 @@ class AlbumEditDialog(QDialog):
         # the extended panel beside it.
         main_panel.setFixedWidth(max(main_panel.sizeHint().width(), DIALOG_MIN_SIZE[0]))
 
-        # Hidden until "More tags" is toggled on -- widening the window only
-        # then, rather than always reserving the space, keeps the common
-        # case (editing the handful of basic fields) uncluttered. As a
-        # sibling of main_panel (not nested inside it), showing/hiding it
-        # can never affect main_panel's own geometry.
-        self.extended_panel = ExtendedTagsPanel("album")
-        self.extended_panel.setFixedWidth(EXTENDED_PANEL_WIDTH)
-        self.extended_panel.setVisible(False)
-        root_layout.addWidget(self.extended_panel)
-
-    def _toggle_extended_panel(self, checked: bool):
-        self.more_tags_btn.setText(tr("btn_fewer_tags") if checked else tr("btn_more_tags"))
-        self.extended_panel.setVisible(checked)
-        # Safe to just fit the window to its new sizeHint (rather than
-        # guessing a resize delta): main_panel is a fixed-width sibling of
-        # the panel, not something the layout can stretch, so this only ever
-        # grows/shrinks the window on the right where the panel lives.
-        self.adjustSize()
+        self._attach_extended_panel(root_layout, "album")
 
     @staticmethod
-    def _joined_value(tracks: list[Track], attr: str) -> str:
+    def _joined_value(values: list[str]) -> str:
         """What to show in a field: the plain value when every track agrees,
         otherwise each track's own value in tree order, ";"-separated. The
         differing values stay visible and editable instead of being hidden
         behind whichever track happened to load first."""
-        values = [getattr(track, attr) for track in tracks]
         if len(set(values)) == 1:
             return values[0]
         return MULTI_VALUE_SEPARATOR.join(values)
+
+    @staticmethod
+    def _is_splittable(values: list[str]) -> bool:
+        """Whether the joined text above can be mapped back onto one value per
+        track.
+
+        Only mixed fields are joined in the first place, and only if none of
+        the values contains the separator itself: a genre of "Rock;Metal" (or
+        an artist with a semicolon in the name) would otherwise produce more
+        segments than there are tracks -- and, worse, with the right number of
+        tracks it would silently deal each fragment out to a different file.
+        A field that fails this test is still shown joined, but editing it
+        applies the whole text to every track, which is the safe reading of
+        "the user replaced this field"."""
+        return len(set(values)) > 1 and not any(MULTI_VALUE_SEPARATOR in value for value in values)
 
     def _load_index(self, index: int):
         self.index = index
         tracks = self.albums[index]
         first = tracks[0]
-        self._new_cover_bytes = None
-        self._new_cover_mime = "image/jpeg"
-        self._new_cover_write_loose = False
+        # Drops an unsaved cover pick and any Tidal lookup started for the
+        # previous album, which must not land on this one.
+        self._reset_pending_cover()
 
         album_name = first.album or tr("unknown_album")
         self.setWindowTitle(tr("dialog_title_edit_album", album=album_name, count=len(tracks)))
+        # Which fields the ";"-joined text can be split back apart on -- see
+        # _is_splittable. Recomputed per album, since it depends on the values.
+        self._splittable_fields: set[str] = set()
         for edit, attr in (
             (self.artist_edit, "artist"),
             (self.album_edit, "album"),
@@ -236,9 +189,12 @@ class AlbumEditDialog(QDialog):
             (self.year_edit, "year"),
             (self.genre_edit, "genre"),
         ):
-            edit.setText(self._joined_value(tracks, attr))
+            values = [getattr(track, attr) for track in tracks]
+            edit.setText(self._joined_value(values))
+            if self._is_splittable(values):
+                self._splittable_fields.add(attr)
         self.info_label.setText(tr("info_apply_to_all", count=len(tracks)))
-        self._load_cover_preview()
+        self._load_cover_preview(self.source_root / first.path)
 
         # See the identical reasoning in TagEditDialog._load_index -- rebuild
         # the field list if the album's format changed, then load values
@@ -258,93 +214,6 @@ class AlbumEditDialog(QDialog):
         self.prev_btn.setEnabled(index > 0)
         self.next_btn.setEnabled(index < len(self.albums) - 1)
 
-    def _show_cover_preview(self, pixmap: QPixmap | None):
-        """Put `pixmap` in the cover preview, keeping the unscaled original
-        on self. Everything that needs the artwork's real dimensions -- the
-        size label, the Tidal comparison -- has to read that copy rather
-        than cover_label's downscaled thumbnail."""
-        self._cover_pixmap = pixmap
-        if pixmap is None or pixmap.isNull():
-            self.cover_label.clear()
-            self.cover_label.setText(tr("cover_none"))
-            self.cover_size_label.clear()
-            return
-        self.cover_label.setPixmap(
-            pixmap.scaled(COVER_SIZE, COVER_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-        self.cover_size_label.setText(f"{pixmap.width()}x{pixmap.height()}")
-
-    def _load_cover_preview(self):
-        file_path = self.source_root / self.tracks[0].path
-        data = tagsmod.read_cover_art(file_path)
-        if data:
-            pixmap = QPixmap()
-            pixmap.loadFromData(data)
-            self._show_cover_preview(pixmap)
-        else:
-            self._show_cover_preview(None)
-
-    def _choose_cover(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("dialog_choose_cover_title"), "", tr("images_filter")
-        )
-        if not path:
-            return
-        image_path = Path(path)
-        cover_bytes, mime = normalize_manual_cover(image_path.read_bytes(), image_path.suffix)
-        self._new_cover_bytes = cover_bytes
-        self._new_cover_mime = mime
-        self._new_cover_write_loose = False
-        pixmap = QPixmap()
-        pixmap.loadFromData(cover_bytes)
-        self._show_cover_preview(pixmap)
-
-    def _download_cover_from_tidal(self):
-        artist = self.artist_edit.text().strip()
-        album = self.album_edit.text().strip()
-        if not artist or not album:
-            QMessageBox.information(
-                self, tr("msg_tidal_missing_fields_title"), tr("msg_tidal_missing_fields_text")
-            )
-            return
-
-        self.tidal_cover_btn.setEnabled(False)
-        self.tidal_cover_btn.setText(tr("btn_downloading_cover_tidal"))
-
-        # Kept alive on self so they aren't garbage-collected while the
-        # background thread runs -- same pattern as MainWindow._EjectWorker.
-        self._tidal_thread = QThread(self)
-        self._tidal_worker = TidalCoverWorker(artist, album, TIDAL_COVER_SIZE)
-        self._tidal_worker.moveToThread(self._tidal_thread)
-        self._tidal_thread.started.connect(self._tidal_worker.run)
-        self._tidal_worker.finished.connect(self._on_tidal_cover_finished)
-        self._tidal_thread.start()
-
-    def _on_tidal_cover_finished(self, data: bytes, error: str):
-        self._tidal_thread.quit()
-        self._tidal_thread.wait()
-        self._tidal_thread = None
-        self._tidal_worker = None
-        self.tidal_cover_btn.setEnabled(True)
-        self.tidal_cover_btn.setText(tr("btn_download_cover_tidal"))
-
-        if error:
-            QMessageBox.warning(self, tr("error_tidal_cover_title"), tr("error_tidal_cover_text", error=error))
-            return
-
-        cover_bytes, mime = normalize_manual_cover(data, ".jpg")
-        new_pixmap = QPixmap()
-        new_pixmap.loadFromData(cover_bytes)
-
-        confirm = CoverCompareDialog(self._cover_pixmap, new_pixmap, self)
-        if confirm.exec() != QDialog.Accepted:
-            return
-
-        self._new_cover_bytes = cover_bytes
-        self._new_cover_mime = mime
-        self._new_cover_write_loose = True
-        self._show_cover_preview(new_pixmap)
-
     def _current_album_fields(self) -> dict:
         return {
             "artist": self.artist_edit.text(),
@@ -363,15 +232,21 @@ class AlbumEditDialog(QDialog):
             return True
         return self.extended_panel.current_values() != self._loaded_extended_fields
 
-    def _values_for_field(self, text: str) -> list[str]:
+    def _values_for_field(self, key: str, text: str) -> list[str]:
         """One value per edited track, from what the field now holds.
 
         A ";"-separated list with exactly one segment per track keeps the
         per-file mapping, so correcting a single entry of
         "artist1;artist2;artist3" only touches that file. Anything else --
         most importantly the whole list replaced by one name -- is applied
-        to every track, which is how a mixed selection gets unified."""
+        to every track, which is how a mixed selection gets unified.
+
+        Splitting only ever happens for fields loaded as a splittable list
+        (see _is_splittable); for every other field the text is one value that
+        goes to all of them, semicolons and all."""
         count = len(self.tracks)
+        if key not in self._splittable_fields:
+            return [text] * count
         parts = [part.strip() for part in text.split(MULTI_VALUE_SEPARATOR)]
         if count > 1 and len(parts) == count:
             return parts
@@ -385,7 +260,7 @@ class AlbumEditDialog(QDialog):
         # overwrite three different artists with whichever one happened to
         # load into the box.
         changed = {key for key, value in album_fields.items() if value != self._loaded_fields.get(key)}
-        resolved = {key: self._values_for_field(album_fields[key]) for key in changed}
+        resolved = {key: self._values_for_field(key, album_fields[key]) for key in changed}
         # Same rule for extended tags, via omission: write_tags leaves out
         # any key absent from `fields`, so an unedited extended tag is never
         # written and each file keeps whatever it already had. (These load
@@ -432,16 +307,9 @@ class AlbumEditDialog(QDialog):
             updated = self.on_saved(track, fields)
             updated_tracks.append(updated if updated is not None else track)
 
-        if self._new_cover_bytes is not None and self._new_cover_write_loose:
-            # Once per directory rather than once per track: a multi-disc
-            # album spread over CD1/, CD2/, ... needs a cover.jpg in each,
-            # but writing it 20 times into the same folder is pointless.
-            album_dirs = {(self.source_root / track.path).parent for track in self.tracks}
-            for album_dir in sorted(album_dirs):
-                try:
-                    album_covers.write_loose_cover(album_dir, self._new_cover_bytes)
-                except OSError as exc:
-                    errors.append(f"{album_dir}: {exc}")
+        errors.extend(
+            self._write_loose_covers((self.source_root / track.path).parent for track in self.tracks)
+        )
 
         if errors:
             QMessageBox.critical(self, tr("error_save_title"), "\n".join(errors))
@@ -469,6 +337,11 @@ class AlbumEditDialog(QDialog):
         self._load_index(self.index + 1)
 
     def _save_and_close(self):
-        if not self._save_current():
+        # Same dirtiness check the Prev/Next navigation does. It matters even
+        # more here than in TagEditDialog: this dialog writes the form's values
+        # into *every* track of the album, so an unconditional save would
+        # rewrite (and rehash) a whole album that nobody edited, making all of
+        # it look missing on the device again.
+        if self._is_dirty() and not self._save_current():
             return
         self.accept()

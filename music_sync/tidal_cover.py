@@ -6,6 +6,8 @@ from difflib import SequenceMatcher
 
 import requests
 
+from .i18n import tr
+
 TIDAL_TOKEN = "CzET4vdadNUFQ5JU"
 SEARCH_URL = "https://api.tidal.com/v1/search/albums"
 # Tidal's search is a fuzzy text search, not an exact lookup -- for an
@@ -143,6 +145,20 @@ class TidalCoverError(Exception):
     """Raised when no album/cover could be found on Tidal for a query."""
 
 
+class TidalUnavailableError(TidalCoverError):
+    """Raised when Tidal rejects the request itself rather than not finding
+    anything: the hardcoded API token above belongs to Tidal's own public web
+    player and can be revoked or rotated at any time, which comes back as a
+    401/403 on every query. Distinguished from "album not found" so the user
+    is told the feature is unavailable instead of the app quietly concluding
+    that none of their albums exist."""
+
+
+# Rejections of the token/request as such, as opposed to a lookup that
+# simply found nothing.
+_AUTH_STATUS_CODES = (401, 403)
+
+
 def _search(query: str, country: str) -> list[dict]:
     resp = requests.get(
         SEARCH_URL,
@@ -150,6 +166,8 @@ def _search(query: str, country: str) -> list[dict]:
         headers={"x-tidal-token": TIDAL_TOKEN},
         timeout=10,
     )
+    if resp.status_code in _AUTH_STATUS_CODES:
+        raise TidalUnavailableError(tr("error_tidal_unavailable", status=resp.status_code))
     resp.raise_for_status()
     return resp.json().get("items", [])
 
@@ -161,7 +179,7 @@ def find_album(artist: str, album: str) -> dict:
     query = f"{artist} {album}"
     # Pooled across regions and de-duplicated by id -- the same album can
     # legitimately turn up (with the same id) under several catalogs.
-    by_id: dict[str, dict] = {}
+    by_id: dict[object, dict] = {}
     last_error: requests.RequestException | None = None
     any_succeeded = False
     for country in SEARCH_COUNTRIES:
@@ -185,13 +203,17 @@ def find_album(artist: str, album: str) -> dict:
     # Only candidates with cover art are worth ranking -- a perfect text
     # match with no artwork is useless to this feature.
     candidates = [item for item in by_id.values() if item.get("cover")] or list(by_id.values())
+    # Scored once and carried through the tie-break below. The tie-break used
+    # to re-run _match_score (which normalises and diffs every artist name
+    # credited on the album) for each close match it compared.
     scored = [(item, _match_score(item, artist, album)) for item in candidates]
     best_score = max(score for _, score in scored)
-    close_matches = [item for item, score in scored if score >= best_score - CLOSE_MATCH_MARGIN]
-    return max(
+    close_matches = [(item, score) for item, score in scored if score >= best_score - CLOSE_MATCH_MARGIN]
+    best, _score = max(
         close_matches,
-        key=lambda item: (_TYPE_PRIORITY.get(item.get("type"), 0), _match_score(item, artist, album)),
+        key=lambda pair: (_TYPE_PRIORITY.get(pair[0].get("type"), 0), pair[1]),
     )
+    return best
 
 
 def cover_url(cover_uuid: str, size: int = 1280) -> str:

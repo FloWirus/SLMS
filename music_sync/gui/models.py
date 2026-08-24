@@ -23,6 +23,11 @@ COLUMN_KEYS = [
 ]
 
 
+# Cached: headerData() is called for every visible header cell on every
+# repaint, and this rebuilt the whole label list (running tr() twelve times)
+# on each of those calls. The labels only depend on the presence label and
+# the language, and changing the language requires a restart.
+@lru_cache(maxsize=8)
 def _columns(presence_label: str = ""):
     headers = []
     for field, label_key in COLUMN_KEYS:
@@ -236,10 +241,7 @@ class TrackTableModel(QAbstractTableModel):
         self._device_hashes = device_hashes
         # Presence feeds that column's sort key, so it has to be rebuilt.
         self._sort_keys.pop("on_device", None)
-        if self._tracks:
-            top_left = self.index(0, 0)
-            bottom_right = self.index(len(self._tracks) - 1, 0)
-            self.dataChanged.emit(top_left, bottom_right, [Qt.DecorationRole])
+        self._emit_column_changed("on_device")
 
     def track_at(self, row: int) -> Track:
         return self._tracks[row]
@@ -248,10 +250,20 @@ class TrackTableModel(QAbstractTableModel):
         return bool(self._tracks) and all(t.hash in self._checked_hashes for t in self._tracks)
 
     def refresh_checked(self) -> None:
-        if self._tracks:
-            top_left = self.index(0, 0)
-            bottom_right = self.index(len(self._tracks) - 1, 0)
-            self.dataChanged.emit(top_left, bottom_right, [Qt.DecorationRole])
+        self._emit_column_changed("checked")
+
+    def _emit_column_changed(self, key: str) -> None:
+        """Repaint one whole column. The column index is looked up from
+        COLUMN_KEYS rather than hardcoded: both of the icon columns used to
+        emit for column 0, so changing device presence repainted the checkbox
+        column and left the presence ticks themselves stale until something
+        else reset the model."""
+        if not self._tracks:
+            return
+        column = next(i for i, (field, _) in enumerate(COLUMN_KEYS) if field == key)
+        top_left = self.index(0, column)
+        bottom_right = self.index(len(self._tracks) - 1, column)
+        self.dataChanged.emit(top_left, bottom_right, [Qt.DecorationRole])
 
     def toggle_checked(self, row: int) -> None:
         track = self._tracks[row]
@@ -263,7 +275,7 @@ class TrackTableModel(QAbstractTableModel):
         checked_keys = self._sort_keys.get("checked")
         if checked_keys is not None:
             checked_keys[row] = ("1" if checked else "0") + _KEY_SEP + self._tiebreak_at(row)
-        index = self.index(row, 0)
+        index = self.index(row, next(i for i, (field, _) in enumerate(COLUMN_KEYS) if field == "checked"))
         self.dataChanged.emit(index, index, [Qt.DecorationRole])
         if self._on_check_changed:
             self._on_check_changed(track.hash, checked)

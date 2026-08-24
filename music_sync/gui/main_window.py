@@ -1,8 +1,9 @@
 import logging
 import shutil
+from contextlib import suppress
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QByteArray, QEventLoop, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -52,6 +53,7 @@ from ..sync import (
     sync_to_device,
 )
 from .album_edit_dialog import AlbumEditDialog
+from .background import TaskContext, TaskWorker
 from .icons import full_presence_icon, partial_presence_icon
 from .media_info_dialog import MediaInfoDialog
 from .models import COLUMN_KEYS, TrackFilterProxyModel, TrackTableModel, format_size, polish_sort_key
@@ -89,6 +91,11 @@ class _EjectWorker(QObject):
 class _TransferProgressDialog(QDialog):
     """Sync progress dialog tracking overall progress across all tracks."""
 
+    # Emitted when the user presses Cancel. The work itself runs on a worker
+    # thread and only polls for this between files, so cancelling is always a
+    # request, never an interruption mid-copy.
+    cancel_requested = Signal()
+
     def __init__(self, initial_text: str, cancel_text: str | None, minimum: int, maximum: int, parent=None):
         super().__init__(parent)
         self.setModal(True)
@@ -110,6 +117,7 @@ class _TransferProgressDialog(QDialog):
 
     def _cancel(self):
         self._cancelled = True
+        self.cancel_requested.emit()
 
     def wasCanceled(self) -> bool:
         return self._cancelled
@@ -142,6 +150,9 @@ class MainWindow(QMainWindow):
         self.source_checked_hashes: set[str] = set()
         self.device_checked_hashes: set[str] = set()
         self._updating_checks = False
+        # True while a scan/sync/delete runs on a worker thread -- see
+        # _begin_task.
+        self._busy = False
         # Live search state, per tree widget: the text currently typed (the
         # tree has no proxy model, so the filter has to be re-applied by
         # hand every time _populate_tree rebuilds it) and the expansion
@@ -169,9 +180,120 @@ class MainWindow(QMainWindow):
         self._restore_last_source()
 
     def closeEvent(self, event):
+        if self._busy:
+            # Closing now would destroy the window (and the databases below)
+            # out from under a worker thread still writing to a card.
+            QMessageBox.information(self, tr("msg_busy_title"), tr("msg_busy_close_text"))
+            event.ignore()
+            return
         self._save_header_states()
         self.settings.save(self.project_root)
+        # Both handles are explicitly closed rather than left to interpreter
+        # shutdown: the device one lives on removable media, where an open
+        # sqlite connection means unflushed data and a card that refuses to
+        # unmount cleanly after the window is gone.
+        for db in (self.library_db, self.device_db):
+            if db is not None:
+                db.close()
+        self.library_db = None
+        self.device_db = None
         super().closeEvent(event)
+
+    # ---------- background work ----------
+
+    def _run_background(self, work, progress_dialog, label_key: str):
+        """Run `work(ctx)` on a worker thread while `progress_dialog` stays
+        live; returns (result, cancelled).
+
+        The wait is a nested event loop rather than a thread.wait(): the GUI
+        thread has to keep processing events for the dialog to repaint, for
+        Cancel to be clickable, and -- crucially -- for the conflict question
+        the worker blocks on to ever get an answer. Blocking the GUI thread
+        here would deadlock exactly that exchange.
+
+        Re-entrancy is held off by _begin_task(): with the window's actions
+        refusing to start while one task runs, the nested loop can't stack a
+        second operation on top of this one.
+        """
+        context = TaskContext()
+        thread = QThread(self)
+        worker = TaskWorker(work, context)
+        worker.moveToThread(thread)
+
+        outcome: dict = {}
+        loop = QEventLoop()
+
+        def on_progress(index: int, total: int, name: str):
+            if total:
+                progress_dialog.setMaximum(total)
+                progress_dialog.setValue(index)
+            progress_dialog.setLabelText(tr(label_key, index=index, total=total, name=name))
+
+        def on_conflict_raised(track: Track, target_path: str):
+            context.answer_conflict(self._ask_conflict(track, Path(target_path)))
+
+        def on_finished(result, error):
+            outcome["result"] = result
+            outcome["error"] = error
+            loop.quit()
+
+        context.progress_reported.connect(on_progress)
+        context.conflict_raised.connect(on_conflict_raised)
+        worker.finished.connect(on_finished)
+        # QProgressDialog offers "canceled"; _TransferProgressDialog offers
+        # its own equivalent. Either way, Cancel only sets a flag the work
+        # polls between files -- nothing is torn out from under it.
+        if hasattr(progress_dialog, "cancel_requested"):
+            progress_dialog.cancel_requested.connect(context.cancel)
+        else:
+            progress_dialog.canceled.connect(context.cancel)
+
+        thread.started.connect(worker.run)
+        thread.start()
+        loop.exec()
+        thread.quit()
+        thread.wait()
+
+        # Read the flag *before* closing: QProgressDialog treats being closed
+        # as being cancelled and emits canceled from its own closeEvent, so
+        # asking afterwards reports every completed operation as cancelled.
+        cancelled = context.should_stop()
+        with suppress(RuntimeError):
+            if hasattr(progress_dialog, "cancel_requested"):
+                progress_dialog.cancel_requested.disconnect(context.cancel)
+            else:
+                progress_dialog.canceled.disconnect(context.cancel)
+        progress_dialog.close()
+
+        if outcome.get("error") is not None:
+            raise outcome["error"]
+        return outcome.get("result"), cancelled
+
+    def _ask_conflict(self, track: Track, target_path: Path) -> ConflictResolution:
+        reply = QMessageBox.question(
+            self,
+            tr("conflict_title"),
+            tr("conflict_text", path=target_path),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        return ConflictResolution.OVERWRITE if reply == QMessageBox.Yes else ConflictResolution.SKIP
+
+    def _begin_task(self) -> bool:
+        """Claim the single "one long operation at a time" slot.
+
+        Everything long now runs in a nested event loop, which keeps the
+        window responsive -- including responsive to another click on Sync.
+        Two scans/syncs/deletes at once would have two threads writing the
+        same database and the same card, so every entry point asks here
+        first."""
+        if self._busy:
+            QMessageBox.information(self, tr("msg_busy_title"), tr("msg_busy_text"))
+            return False
+        self._busy = True
+        return True
+
+    def _end_task(self) -> None:
+        self._busy = False
 
     @staticmethod
     def _clear_sort_indicator(view: QTableView) -> None:
@@ -648,7 +770,7 @@ class MainWindow(QMainWindow):
         self.source_root = Path(directory)
         if self.library_db:
             self.library_db.close()
-        self.library_db = MusicDatabase(library_db_path(self.project_root))
+        self.library_db = self._open_library_db(self.source_root)
         self.settings.last_source_root = str(self.source_root)
         self.settings.save(self.project_root)
         self._rescan_source()
@@ -660,34 +782,62 @@ class MainWindow(QMainWindow):
         if not directory.is_dir():
             return
         self.source_root = directory
-        self.library_db = MusicDatabase(library_db_path(self.project_root))
+        self.library_db = self._open_library_db(directory)
         self._refresh_views()
+
+    def _open_library_db(self, source_root: Path) -> MusicDatabase:
+        """The index for this source directory, carrying the old shared
+        database over the first time.
+
+        The migration is deliberately narrow: the single library.db that
+        earlier versions used describes whichever directory was open last, so
+        it is only adopted for that one -- adopting it for a different folder
+        would present another library's rows as this one's.
+        """
+        path = library_db_path(self.project_root, source_root)
+        legacy = library_db_path(self.project_root)
+        if not path.exists() and legacy.is_file() and self.settings.last_source_root:
+            if Path(self.settings.last_source_root) == Path(source_root):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                legacy.rename(path)
+        return MusicDatabase(path)
 
     def _scan_with_progress(self, root: Path, db: MusicDatabase) -> tuple[list, bool]:
         """Scan root and reconcile db with what's actually on disk (drops
         stale rows for files removed outside the app), showing a progress
-        dialog. Returns the up-to-date tracks plus whether the user cancelled."""
+        dialog. Returns the up-to-date tracks plus whether the user cancelled.
+
+        The scan itself (which hashes every changed file) runs on a worker
+        thread -- see _run_background."""
+        if not self._begin_task():
+            return [], True
+
         progress = QProgressDialog(tr("progress_scanning_label_initial"), tr("progress_cancel"), 0, 0, self)
         progress.setWindowTitle(f"{APP_NAME} — {tr('progress_scanning_title')}")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
+        # Without this the dialog keeps closing itself the moment a value is
+        # set, since QProgressDialog auto-closes on reaching its maximum.
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
 
-        def on_progress(index: int, total: int, path: Path):
-            if total:
-                progress.setMaximum(total)
-                progress.setValue(index)
-            progress.setLabelText(tr("progress_scanning_label", index=index, total=total, name=path.name))
-            QApplication.processEvents()
+        def work(ctx):
+            return scan_directory(
+                root,
+                db,
+                progress_callback=lambda index, total, path: ctx.progress(index, total, path.name),
+                should_stop=ctx.should_stop,
+            )
 
-        tracks = scan_directory(
-            root,
-            db,
-            progress_callback=on_progress,
-            should_stop=progress.wasCanceled,
-        )
-        cancelled = progress.wasCanceled()
-        progress.close()
-        return tracks, cancelled
+        try:
+            tracks, cancelled = self._run_background(work, progress, "progress_scanning_label")
+        except OSError as exc:
+            logger.exception("scan failed")
+            QMessageBox.critical(self, tr("msg_scan_failed_title"), str(exc))
+            return [], True
+        finally:
+            self._end_task()
+        return tracks or [], cancelled
 
     def _rescan_source(self):
         if not self.source_root or not self.library_db:
@@ -1276,15 +1426,23 @@ class MainWindow(QMainWindow):
             description = tr("sync_whole_device")
         self._sync_tracks_from_device(tracks, description)
 
-    def _tracks_for_artist(self, artist: str) -> list[Track]:
-        return [t for t in self.library_db.all_tracks() if (t.artist or tr("unknown_artist")) == artist]
+    @staticmethod
+    def _tracks_of_artist(tracks: list[Track], artist: str) -> list[Track]:
+        return [t for t in tracks if (t.artist or tr("unknown_artist")) == artist]
 
-    def _tracks_for_album(self, artist: str, album: str) -> list[Track]:
+    @staticmethod
+    def _tracks_of_album(tracks: list[Track], artist: str, album: str) -> list[Track]:
         return [
             t
-            for t in self.library_db.all_tracks()
+            for t in tracks
             if (t.artist or tr("unknown_artist")) == artist and (t.album or tr("unknown_album")) == album
         ]
+
+    def _tracks_for_artist(self, artist: str) -> list[Track]:
+        return self._tracks_of_artist(self.library_db.all_tracks(), artist)
+
+    def _tracks_for_album(self, artist: str, album: str) -> list[Track]:
+        return self._tracks_of_album(self.library_db.all_tracks(), artist, album)
 
     def _sync_tracks(self, tracks: list[Track], description: str):
         if not self.source_root or not self.library_db:
@@ -1315,6 +1473,9 @@ class MainWindow(QMainWindow):
                 return
             cover_resize = CoverResizeSettings(max_size=int(size_text), dpi=int(dpi_text))
 
+        if not self._confirm_free_space(tracks):
+            return
+
         reply = QMessageBox.question(
             self,
             tr("confirm_sync_title"),
@@ -1323,60 +1484,70 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        progress = _TransferProgressDialog(
-            tr("progress_sync_label_initial"), tr("progress_cancel"), 0, len(tracks), self
-        )
-        progress.setWindowTitle(f"{APP_NAME} — {tr('progress_sync_title')}")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.show()
+        mountpoint = Path(self.selected_device.mountpoint)
+        source_root = self.source_root
+        dir_template = self.settings.dir_template
+        filename_template = self.settings.filename_template
+        track_no_fix = self.settings.track_no_fix
+        force = self.force_checkbox.isChecked()
 
-        def on_scan_progress(index, total, path: Path):
-            if total:
-                progress.setMaximum(total)
-                progress.setValue(index)
-            progress.setLabelText(tr("progress_scanning_label", index=index, total=total, name=path.name))
-            QApplication.processEvents()
-
-        def on_progress(index, total, track: Track):
-            progress.setMaximum(total)
-            progress.setValue(index)
-            progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
-            QApplication.processEvents()
-
-        def on_conflict(track: Track, target_path: Path) -> ConflictResolution:
-            reply = QMessageBox.question(
-                self,
-                tr("conflict_title"),
-                tr("conflict_text", path=target_path),
-                QMessageBox.Yes | QMessageBox.No,
+        def work(ctx):
+            # Everything this closure touches was read off the widgets above,
+            # on the GUI thread: a worker must never reach back into a
+            # checkbox or a combo box to find out what it is doing.
+            return sync_to_device(
+                source_root,
+                tracks,
+                mountpoint,
+                dir_template,
+                filename_template,
+                on_conflict=ctx.ask_conflict,
+                on_progress=lambda index, total, track: ctx.progress(index, total, track.filename),
+                conversion=conversion,
+                cover_resize=cover_resize,
+                track_no_fix=track_no_fix,
+                on_scan_progress=lambda index, total, path: ctx.progress(index, total, path.name),
+                force=force,
+                should_stop=ctx.should_stop,
             )
-            return ConflictResolution.OVERWRITE if reply == QMessageBox.Yes else ConflictResolution.SKIP
 
-        result = sync_to_device(
-            self.source_root,
-            tracks,
-            Path(self.selected_device.mountpoint),
-            self.settings.dir_template,
-            self.settings.filename_template,
-            on_conflict=on_conflict,
-            on_progress=on_progress,
-            conversion=conversion,
-            cover_resize=cover_resize,
-            track_no_fix=self.settings.track_no_fix,
-            on_scan_progress=on_scan_progress,
-            force=self.force_checkbox.isChecked(),
-            should_stop=progress.wasCanceled,
-        )
-        progress.close()
+        result = self._run_transfer(work, len(tracks))
+        if result is None:
+            return
 
         self.source_checked_hashes.clear()
         self.device_checked_hashes.clear()
-        # sync_to_device() scanned the device up front and registered every
-        # file it wrote, so its database is already current -- reopen it to
-        # pick that up, but don't scan the whole card a second time.
+        # sync_to_device() reconciled the device database and registered every
+        # file it wrote, so it is already current -- reopen it to pick that
+        # up, but don't scan the whole card a second time.
         self._on_device_selected(self.device_combo.currentIndex(), rescan=False)
 
         self._show_sync_result(result)
+
+    def _confirm_free_space(self, tracks: list[Track]) -> bool:
+        """Check up front that the tracks about to be copied plausibly fit on
+        the device, instead of discovering it one ENOSPC at a time half-way
+        through a sync and handing back a list of a thousand identical errors.
+
+        An estimate on purpose, hence a warning the user can override rather
+        than a hard stop: tracks already on the device won't be copied again,
+        and conversion usually makes files smaller -- so this over-counts,
+        and being wrong in that direction must not block a sync that would
+        actually have fit."""
+        needed = sum(track.size for track in tracks)
+        try:
+            free = shutil.disk_usage(self.selected_device.mountpoint).free
+        except OSError:
+            return True
+        if needed <= free:
+            return True
+        reply = QMessageBox.warning(
+            self,
+            tr("msg_not_enough_space_title"),
+            tr("msg_not_enough_space_text", needed=format_size(needed), free=format_size(free)),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
 
     def _sync_tracks_from_device(self, tracks: list[Track], description: str):
         if not self.source_root or not self.library_db:
@@ -1396,54 +1567,60 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        progress = _TransferProgressDialog(
-            tr("progress_sync_label_initial"), tr("progress_cancel"), 0, len(tracks), self
-        )
-        progress.setWindowTitle(f"{APP_NAME} — {tr('progress_sync_title')}")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.show()
+        mountpoint = Path(self.selected_device.mountpoint)
+        source_root = self.source_root
+        library_db = self.library_db
+        dir_template = self.settings.dir_template
+        filename_template = self.settings.filename_template
 
-        def on_scan_progress(index, total, path: Path):
-            if total:
-                progress.setMaximum(total)
-                progress.setValue(index)
-            progress.setLabelText(tr("progress_scanning_label", index=index, total=total, name=path.name))
-            QApplication.processEvents()
-
-        def on_progress(index, total, track: Track):
-            progress.setMaximum(total)
-            progress.setValue(index)
-            progress.setLabelText(tr("progress_sync_label", index=index, total=total, name=track.filename))
-            QApplication.processEvents()
-
-        def on_conflict(track: Track, target_path: Path) -> ConflictResolution:
-            reply = QMessageBox.question(
-                self,
-                tr("conflict_title"),
-                tr("conflict_text", path=target_path),
-                QMessageBox.Yes | QMessageBox.No,
+        def work(ctx):
+            return sync_from_device(
+                mountpoint,
+                tracks,
+                source_root,
+                library_db,
+                dir_template,
+                filename_template,
+                on_conflict=ctx.ask_conflict,
+                on_progress=lambda index, total, track: ctx.progress(index, total, track.filename),
+                on_scan_progress=lambda index, total, path: ctx.progress(index, total, path.name),
+                should_stop=ctx.should_stop,
             )
-            return ConflictResolution.OVERWRITE if reply == QMessageBox.Yes else ConflictResolution.SKIP
 
-        result = sync_from_device(
-            Path(self.selected_device.mountpoint),
-            tracks,
-            self.source_root,
-            self.library_db,
-            self.settings.dir_template,
-            self.settings.filename_template,
-            on_conflict=on_conflict,
-            on_progress=on_progress,
-            on_scan_progress=on_scan_progress,
-            should_stop=progress.wasCanceled,
-        )
-        progress.close()
+        result = self._run_transfer(work, len(tracks))
+        if result is None:
+            return
 
         self.source_checked_hashes.clear()
         self.device_checked_hashes.clear()
         self._refresh_views()
 
         self._show_sync_result(result)
+
+    def _run_transfer(self, work, track_count: int) -> SyncResult | None:
+        """Put a transfer on a worker thread behind the progress dialog, in
+        the one shape both directions want. Returns None when the transfer
+        never ran (another operation holds the slot) or failed outright,
+        which is also when the caller must not go on to refresh anything."""
+        if not self._begin_task():
+            return None
+
+        progress = _TransferProgressDialog(
+            tr("progress_sync_label_initial"), tr("progress_cancel"), 0, track_count, self
+        )
+        progress.setWindowTitle(f"{APP_NAME} — {tr('progress_sync_title')}")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        try:
+            result, _cancelled = self._run_background(work, progress, "progress_sync_label")
+            return result
+        except Exception as exc:
+            logger.exception("transfer failed")
+            QMessageBox.critical(self, tr("msg_sync_failed_title"), str(exc))
+            return None
+        finally:
+            self._end_task()
 
     def _show_sync_result(self, result: SyncResult) -> None:
         message = (
@@ -1463,24 +1640,52 @@ class MainWindow(QMainWindow):
 
     # ---------- tag editing ----------
 
-    def _table_ordered_tracks(self) -> list[Track]:
+    @staticmethod
+    def _ordered_tracks(proxy_model, table_model) -> list[Track]:
+        """The table's tracks in the order the view currently shows them
+        (i.e. after sorting and filtering), which is the order Prev/Next in
+        the tag dialog then walks."""
         tracks = []
-        for row in range(self.proxy_model.rowCount()):
-            source_row = self.proxy_model.mapToSource(self.proxy_model.index(row, 0)).row()
-            tracks.append(self.table_model.track_at(source_row))
+        for row in range(proxy_model.rowCount()):
+            source_row = proxy_model.mapToSource(proxy_model.index(row, 0)).row()
+            tracks.append(table_model.track_at(source_row))
         return tracks
 
-    def _flatten_tree_tracks(self) -> list[Track]:
-        tracks = []
-        for i in range(self.tree_widget.topLevelItemCount()):
-            artist_item = self.tree_widget.topLevelItem(i)
+    def _flatten_tree_tracks(self, tree_widget: QTreeWidget) -> list[Track]:
+        """Every track in a tree, top to bottom."""
+        return [
+            (track_item.data(0, Qt.UserRole) or {})["track"]
+            for _artist, _album, track_item in self._tree_nodes(tree_widget)
+            if track_item is not None and (track_item.data(0, Qt.UserRole) or {}).get("type") == "track"
+        ]
+
+    def _flatten_tree_albums(self, tree_widget: QTreeWidget) -> list[list[Track]]:
+        """Every album in a tree as its own list of tracks, in tree order --
+        what the album editor pages through with Prev/Next album."""
+        albums: list[list[Track]] = []
+        for i in range(tree_widget.topLevelItemCount()):
+            artist_item = tree_widget.topLevelItem(i)
             for j in range(artist_item.childCount()):
                 album_item = artist_item.child(j)
-                for k in range(album_item.childCount()):
-                    data = album_item.child(k).data(0, Qt.UserRole) or {}
-                    if data.get("type") == "track":
-                        tracks.append(data["track"])
-        return tracks
+                tracks = [
+                    (album_item.child(k).data(0, Qt.UserRole) or {})["track"]
+                    for k in range(album_item.childCount())
+                    if (album_item.child(k).data(0, Qt.UserRole) or {}).get("type") == "track"
+                ]
+                if tracks:
+                    albums.append(tracks)
+        return albums
+
+    @staticmethod
+    def _album_start_index(albums: list[list[Track]], artist: str, album: str) -> int:
+        """Which album in the list the editor should open on -- the one the
+        user right-clicked. Matched on the same "unknown" fallbacks the tree
+        labels use, so a track with no artist tag still finds its node."""
+        for index, tracks in enumerate(albums):
+            first = tracks[0]
+            if (first.artist or tr("unknown_artist")) == artist and (first.album or tr("unknown_album")) == album:
+                return index
+        return 0
 
     def _selected_tree_tracks(self, tree_widget: QTreeWidget) -> list[Track]:
         """Tracks covered by the current selection, in the order they appear
@@ -1507,6 +1712,17 @@ class MainWindow(QMainWindow):
         rows = sorted(view.selectionModel().selectedRows(), key=lambda index: index.row())
         return [table_model.track_at(proxy_model.mapToSource(index).row()) for index in rows]
 
+    def _open_dialog(self, dialog_class, root: Path, items: list, start_index: int, on_saved) -> None:
+        """Open one of the two tag editors and refresh the views afterwards.
+
+        Both editors take the same arguments and are used from both panes;
+        the only thing that differs between the four combinations is which
+        root the files live under and which persist callback writes the
+        result back to the right database."""
+        dialog = dialog_class(root, items, start_index, on_saved=on_saved, settings=self.settings, parent=self)
+        dialog.exec()
+        self._refresh_views()
+
     def _edit_tracks_as_album(self, tracks: list[Track]):
         """Edit a loose multi-selection through the album dialog: it offers
         exactly the fields that make sense to apply to several tracks at
@@ -1515,54 +1731,47 @@ class MainWindow(QMainWindow):
         same value."""
         if not self.source_root or not self.library_db or not tracks:
             return
-        dialog = AlbumEditDialog(
-            self.source_root,
-            [list(tracks)],
-            0,
-            on_saved=self._persist_track_edit,
-            settings=self.settings,
-            parent=self,
-        )
-        dialog.exec()
-        self._refresh_views()
+        self._open_dialog(AlbumEditDialog, self.source_root, [list(tracks)], 0, self._persist_track_edit)
 
     def _edit_device_tracks_as_album(self, tracks: list[Track]):
         if not self.selected_device or not self.device_db or not tracks:
             return
-        dialog = AlbumEditDialog(
+        self._open_dialog(
+            AlbumEditDialog,
             Path(self.selected_device.mountpoint),
             [list(tracks)],
             0,
-            on_saved=self._persist_device_track_edit,
-            settings=self.settings,
-            parent=self,
+            self._persist_device_track_edit,
         )
-        dialog.exec()
-        self._refresh_views()
 
     def _edit_selected_table_track(self, proxy_index):
-        tracks = self._table_ordered_tracks()
+        tracks = self._ordered_tracks(self.proxy_model, self.table_model)
         self._edit_track_sequence(tracks, proxy_index.row())
 
     def _edit_tree_item(self, item: QTreeWidgetItem, column: int):
         data = item.data(0, Qt.UserRole) or {}
         if data.get("type") != "track":
             return
-        tracks = self._flatten_tree_tracks()
+        tracks = self._flatten_tree_tracks(self.tree_widget)
         index = tracks.index(data["track"]) if data["track"] in tracks else 0
         self._edit_track_sequence(tracks, index)
 
     def _edit_track_sequence(self, tracks: list[Track], start_index: int):
         if not self.source_root or not self.library_db or not tracks:
             return
-        dialog = TagEditDialog(
-            self.source_root, tracks, start_index, on_saved=self._persist_track_edit, settings=self.settings, parent=self
-        )
-        dialog.exec()
-        self._refresh_views()
+        self._open_dialog(TagEditDialog, self.source_root, tracks, start_index, self._persist_track_edit)
 
-    def _persist_track_edit(self, old_track: Track, fields: dict) -> Track:
-        new_path = self.source_root / fields["path"]
+    @staticmethod
+    def _persist_edit(db: MusicDatabase, root: Path, old_track: Track, fields: dict, source_hash: str | None) -> Track:
+        """Write a tag edit back to one of the databases: re-read the file's
+        hash/size/mtime (the edit changed them), carry the new field values
+        over, and move the row if the file was renamed.
+
+        `source_hash` is what distinguishes the two sides. A library row is
+        its own source, so it takes the file's new hash; a device row keeps
+        pointing at whatever library track it was copied from, which editing
+        the copy on the card does not change."""
+        new_path = root / fields["path"]
         new_hash = hash_file(new_path)
         stat = new_path.stat()
         updated = Track(
@@ -1570,7 +1779,7 @@ class MainWindow(QMainWindow):
             path=fields["path"],
             filename=new_path.name,
             hash=new_hash,
-            source_hash=new_hash,
+            source_hash=new_hash if source_hash is None else source_hash,
             artist=fields["artist"],
             album=fields["album"],
             title=fields["title"],
@@ -1584,120 +1793,69 @@ class MainWindow(QMainWindow):
             mtime=stat.st_mtime,
         )
         if updated.path != old_track.path:
-            self.library_db.delete_by_path(old_track.path)
-        self.library_db.upsert_track(updated)
+            db.delete_by_path(old_track.path)
+        db.upsert_track(updated)
         return updated
 
-    def _device_table_ordered_tracks(self) -> list[Track]:
-        tracks = []
-        for row in range(self.device_proxy_model.rowCount()):
-            source_row = self.device_proxy_model.mapToSource(self.device_proxy_model.index(row, 0)).row()
-            tracks.append(self.device_table_model.track_at(source_row))
-        return tracks
-
-    def _flatten_device_tree_tracks(self) -> list[Track]:
-        tracks = []
-        for i in range(self.device_tree_widget.topLevelItemCount()):
-            artist_item = self.device_tree_widget.topLevelItem(i)
-            for j in range(artist_item.childCount()):
-                album_item = artist_item.child(j)
-                for k in range(album_item.childCount()):
-                    data = album_item.child(k).data(0, Qt.UserRole) or {}
-                    if data.get("type") == "track":
-                        tracks.append(data["track"])
-        return tracks
-
-    def _flatten_device_tree_albums(self) -> list[list[Track]]:
-        albums = []
-        for i in range(self.device_tree_widget.topLevelItemCount()):
-            artist_item = self.device_tree_widget.topLevelItem(i)
-            for j in range(artist_item.childCount()):
-                album_item = artist_item.child(j)
-                tracks = []
-                for k in range(album_item.childCount()):
-                    data = album_item.child(k).data(0, Qt.UserRole) or {}
-                    if data.get("type") == "track":
-                        tracks.append(data["track"])
-                if tracks:
-                    albums.append(tracks)
-        return albums
+    def _persist_track_edit(self, old_track: Track, fields: dict) -> Track:
+        updated = self._persist_edit(self.library_db, self.source_root, old_track, fields, source_hash=None)
+        # Editing tags rewrites the file, so its hash changes -- and copies
+        # already sitting on the connected device are registered against the
+        # old one. Move that registration over, or the track would show up as
+        # missing from the device and get copied a second time. Only possible
+        # for the device that happens to be plugged in right now; one edited
+        # while another card was connected still loses the link until that
+        # card is re-synced.
+        if updated.hash != old_track.hash and self.device_db is not None:
+            if self.device_db.reassign_source_hash(old_track.hash, updated.hash):
+                self.device_hashes = self.device_db.source_hashes()
+        return updated
 
     def _edit_selected_device_table_track(self, proxy_index):
-        tracks = self._device_table_ordered_tracks()
+        tracks = self._ordered_tracks(self.device_proxy_model, self.device_table_model)
         self._edit_device_track_sequence(tracks, proxy_index.row())
 
     def _edit_device_tree_item(self, item: QTreeWidgetItem, column: int):
         data = item.data(0, Qt.UserRole) or {}
         if data.get("type") != "track":
             return
-        tracks = self._flatten_device_tree_tracks()
+        tracks = self._flatten_tree_tracks(self.device_tree_widget)
         index = tracks.index(data["track"]) if data["track"] in tracks else 0
         self._edit_device_track_sequence(tracks, index)
 
     def _edit_device_track_sequence(self, tracks: list[Track], start_index: int):
         if not self.selected_device or not self.device_db or not tracks:
             return
-        dialog = TagEditDialog(
+        self._open_dialog(
+            TagEditDialog,
             Path(self.selected_device.mountpoint),
             tracks,
             start_index,
-            on_saved=self._persist_device_track_edit,
-            settings=self.settings,
-            parent=self,
+            self._persist_device_track_edit,
         )
-        dialog.exec()
-        self._refresh_views()
 
     def _edit_device_album_tags(self, artist: str, album: str):
         if not self.selected_device or not self.device_db:
             return
-        albums = self._flatten_device_tree_albums()
+        albums = self._flatten_tree_albums(self.device_tree_widget)
         if not albums:
             return
-        start_index = 0
-        for idx, tracks in enumerate(albums):
-            first = tracks[0]
-            if (first.artist or tr("unknown_artist")) == artist and (first.album or tr("unknown_album")) == album:
-                start_index = idx
-                break
-        dialog = AlbumEditDialog(
+        self._open_dialog(
+            AlbumEditDialog,
             Path(self.selected_device.mountpoint),
             albums,
-            start_index,
-            on_saved=self._persist_device_track_edit,
-            settings=self.settings,
-            parent=self,
+            self._album_start_index(albums, artist, album),
+            self._persist_device_track_edit,
         )
-        dialog.exec()
-        self._refresh_views()
 
     def _persist_device_track_edit(self, old_track: Track, fields: dict) -> Track:
-        device_root = Path(self.selected_device.mountpoint)
-        new_path = device_root / fields["path"]
-        new_hash = hash_file(new_path)
-        stat = new_path.stat()
-        updated = Track(
-            id=old_track.id,
-            path=fields["path"],
-            filename=new_path.name,
-            hash=new_hash,
+        return self._persist_edit(
+            self.device_db,
+            Path(self.selected_device.mountpoint),
+            old_track,
+            fields,
             source_hash=old_track.source_hash,
-            artist=fields["artist"],
-            album=fields["album"],
-            title=fields["title"],
-            track_number=fields["track_number"],
-            track_total=fields["track_total"],
-            disc_number=fields["disc_number"],
-            year=fields["year"],
-            genre=fields["genre"],
-            format=old_track.format,
-            size=stat.st_size,
-            mtime=stat.st_mtime,
         )
-        if updated.path != old_track.path:
-            self.device_db.delete_by_path(old_track.path)
-        self.device_db.upsert_track(updated)
-        return updated
 
     # ---------- context menus ----------
 
@@ -1722,7 +1880,7 @@ class MainWindow(QMainWindow):
         index = self.table_view.indexAt(pos)
         if not index.isValid():
             return
-        tracks = self._table_ordered_tracks()
+        tracks = self._ordered_tracks(self.proxy_model, self.table_model)
         track = tracks[index.row()]
         self._show_track_menu(
             track,
@@ -1741,7 +1899,7 @@ class MainWindow(QMainWindow):
         global_pos = self.tree_widget.viewport().mapToGlobal(pos)
 
         if item_type == "track":
-            tracks = self._flatten_tree_tracks()
+            tracks = self._flatten_tree_tracks(self.tree_widget)
             track = data["track"]
             index = tracks.index(track) if track in tracks else 0
             self._show_track_menu(track, tracks, index, global_pos, self._selected_tree_tracks(self.tree_widget))
@@ -1754,7 +1912,7 @@ class MainWindow(QMainWindow):
         index = self.device_table_view.indexAt(pos)
         if not index.isValid():
             return
-        tracks = self._device_table_ordered_tracks()
+        tracks = self._ordered_tracks(self.device_proxy_model, self.device_table_model)
         source_row = self.device_proxy_model.mapToSource(self.device_proxy_model.index(index.row(), 0)).row()
         track = self.device_table_model.track_at(source_row)
         self._show_device_track_menu(
@@ -1774,7 +1932,7 @@ class MainWindow(QMainWindow):
         global_pos = self.device_tree_widget.viewport().mapToGlobal(pos)
 
         if item_type == "track":
-            tracks = self._flatten_device_tree_tracks()
+            tracks = self._flatten_tree_tracks(self.device_tree_widget)
             track = data["track"]
             index = tracks.index(track) if track in tracks else 0
             self._show_device_track_menu(
@@ -1886,38 +2044,19 @@ class MainWindow(QMainWindow):
         elif action == delete_action:
             self._delete_library_album(artist, album)
 
-    def _flatten_tree_albums(self) -> list[list[Track]]:
-        albums = []
-        for i in range(self.tree_widget.topLevelItemCount()):
-            artist_item = self.tree_widget.topLevelItem(i)
-            for j in range(artist_item.childCount()):
-                album_item = artist_item.child(j)
-                tracks = []
-                for k in range(album_item.childCount()):
-                    data = album_item.child(k).data(0, Qt.UserRole) or {}
-                    if data.get("type") == "track":
-                        tracks.append(data["track"])
-                if tracks:
-                    albums.append(tracks)
-        return albums
-
     def _edit_album_tags(self, artist: str, album: str):
         if not self.source_root or not self.library_db:
             return
-        albums = self._flatten_tree_albums()
+        albums = self._flatten_tree_albums(self.tree_widget)
         if not albums:
             return
-        start_index = 0
-        for idx, tracks in enumerate(albums):
-            first = tracks[0]
-            if (first.artist or tr("unknown_artist")) == artist and (first.album or tr("unknown_album")) == album:
-                start_index = idx
-                break
-        dialog = AlbumEditDialog(
-            self.source_root, albums, start_index, on_saved=self._persist_track_edit, settings=self.settings, parent=self
+        self._open_dialog(
+            AlbumEditDialog,
+            self.source_root,
+            albums,
+            self._album_start_index(albums, artist, album),
+            self._persist_track_edit,
         )
-        dialog.exec()
-        self._refresh_views()
 
     def _delete_from_device(self, track: Track):
         if not self.selected_device or not self.device_db:
@@ -1930,25 +2069,32 @@ class MainWindow(QMainWindow):
     # ---------- deletion ----------
 
     def _device_tracks_for_artist(self, artist: str) -> list[Track]:
-        return [t for t in self.device_db.all_tracks() if (t.artist or tr("unknown_artist")) == artist]
+        return self._tracks_of_artist(self.device_db.all_tracks(), artist)
 
     def _device_tracks_for_album(self, artist: str, album: str) -> list[Track]:
-        return [
-            t
-            for t in self.device_db.all_tracks()
-            if (t.artist or tr("unknown_artist")) == artist and (t.album or tr("unknown_album")) == album
-        ]
+        return self._tracks_of_album(self.device_db.all_tracks(), artist, album)
 
     def _delete_library_tracks(self, tracks: list[Track]):
         if not self.source_root or not self.library_db or not tracks:
             return
+        errors: list[str] = []
         for track in tracks:
             file_path = self.source_root / track.path
-            if file_path.exists():
-                file_path.unlink()
-                remove_empty_parent_dirs(file_path.parent, self.source_root)
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+                    remove_empty_parent_dirs(file_path.parent, self.source_root)
+            except OSError as exc:
+                # A read-only file or a permission problem must not abort the
+                # rest of a multi-track delete, and its row has to stay --
+                # the file is still there.
+                logger.error(tr("log_delete_failed", path=track.path, error=exc))
+                errors.append(f"{track.path}: {exc}")
+                continue
             self.library_db.delete_by_path(track.path)
         self._refresh_views()
+        if errors:
+            QMessageBox.critical(self, tr("msg_delete_failed_title"), "\n".join(errors[:10]))
 
     def _delete_library_track(self, track: Track):
         reply = QMessageBox.question(
@@ -1987,21 +2133,34 @@ class MainWindow(QMainWindow):
             self.device_db.close()
             self.device_db = None
 
+        if not self._begin_task():
+            return
+
         progress = QProgressDialog(tr("progress_deleting_label_initial"), None, 0, len(tracks), self)
         progress.setWindowTitle(f"{APP_NAME} — {tr('progress_deleting_title')}")
         progress.setWindowModality(Qt.WindowModal)
         progress.setCancelButton(None)
         progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
         progress.show()
 
-        def on_delete_progress(index: int, total: int, track: Track):
-            progress.setValue(index - 1)
-            progress.setLabelText(tr("progress_deleting_label", index=index, total=total, name=track.filename))
-            QApplication.processEvents()
+        mountpoint = Path(self.selected_device.mountpoint)
 
-        delete_many_from_device(Path(self.selected_device.mountpoint), tracks, on_progress=on_delete_progress)
-        progress.setValue(len(tracks))
-        progress.close()
+        def work(ctx):
+            delete_many_from_device(
+                mountpoint,
+                tracks,
+                on_progress=lambda index, total, track: ctx.progress(index, total, track.filename),
+            )
+
+        try:
+            self._run_background(work, progress, "progress_deleting_label")
+        except OSError as exc:
+            logger.error(tr("log_delete_failed", path=mountpoint, error=exc))
+            QMessageBox.critical(self, tr("msg_delete_failed_title"), str(exc))
+        finally:
+            self._end_task()
 
         # Deletion removed exactly these files and their rows, so the device
         # database stays accurate -- no rescan needed to reflect it.
