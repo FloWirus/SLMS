@@ -111,6 +111,28 @@ def _numeric_sort_key(value) -> float:
         return float("inf")
 
 
+# Numbers are encoded as fixed-width zero-padded digit strings rather than
+# left as floats, so that every column's sort key is a string and can carry
+# the tiebreaker below appended to it. Width 20 covers file sizes with the
+# x1000 scaling that keeps three decimals of precision.
+_NUMERIC_WIDTH = 20
+_NUMERIC_MAX = 10 ** _NUMERIC_WIDTH - 2
+
+
+def _numeric_sort_string(value) -> str:
+    number = _numeric_sort_key(value)
+    if number == float("inf"):
+        # Blank/non-numeric still sorts after every real number, as before.
+        return "9" * _NUMERIC_WIDTH
+    return f"{min(max(int(round(number * 1000)), 0), _NUMERIC_MAX):0{_NUMERIC_WIDTH}d}"
+
+
+# Separator between the parts of a composite key. Below "0", so it always
+# compares less than any digit a key part can start with -- that makes a
+# shorter part sort before a longer one that merely extends it.
+_KEY_SEP = "\x00"
+
+
 class TrackTableModel(QAbstractTableModel):
     def __init__(
         self,
@@ -129,11 +151,14 @@ class TrackTableModel(QAbstractTableModel):
         # Lazily built, one lowercase string per track, holding every field
         # the search box looks at -- see haystack_at.
         self._haystacks: list[str] | None = None
+        # Sort keys, built per column on first use -- see sort_key_at.
+        self._sort_keys: dict[str, list[str]] = {}
 
     def set_tracks(self, tracks: list[Track]) -> None:
         self.beginResetModel()
         self._tracks = tracks
         self._haystacks = None
+        self._sort_keys.clear()
         self.endResetModel()
 
     def haystack_at(self, row: int) -> str:
@@ -166,8 +191,51 @@ class TrackTableModel(QAbstractTableModel):
             ]
         return self._haystacks[row]
 
+    def _tiebreak_at(self, row: int) -> str:
+        """The row's own position in the source model, zero-padded.
+
+        Appended to every column's sort key so rows the sorted column can't
+        tell apart still have exactly one valid order. Source position is the
+        right fallback and the cheapest one: all_tracks() already returns
+        rows ordered by artist, album, disc, track, so falling back to it
+        reproduces that natural order, and comparing an 8-digit index beats
+        comparing the concatenated artist/album/title keys it stands in for.
+        """
+        return f"{row:08d}"
+
+    def sort_key_at(self, row: int, key: str) -> str:
+        """The value the proxy sorts this cell on (it sorts through
+        Qt.UserRole -- see MainWindow._build_table_view).
+
+        Every key is a string ending in the same tiebreaker, giving the table
+        a total order. Without it the sort has ties everywhere -- the two
+        boolean columns tie for nearly every row, and so does any year or
+        genre shared across a library -- and since Qt's sort is not stable,
+        tied rows came back from a filter change in a different order than
+        they went in: clearing a search visibly reshuffled the table.
+
+        Built once per column and reused, so sorting reads a list rather than
+        recomputing a key per comparison.
+        """
+        keys = self._sort_keys.get(key)
+        if keys is None:
+            if key == "checked":
+                heads = ["1" if t.hash in self._checked_hashes else "0" for t in self._tracks]
+            elif key == "on_device":
+                heads = ["1" if t.source_hash in self._device_hashes else "0" for t in self._tracks]
+            elif key in _NUMERIC_COLUMNS:
+                heads = [_numeric_sort_string(getattr(t, key)) for t in self._tracks]
+            else:
+                heads = [polish_sort_key(str(getattr(t, key) or "")) for t in self._tracks]
+            keys = self._sort_keys[key] = [
+                head + _KEY_SEP + self._tiebreak_at(row) for row, head in enumerate(heads)
+            ]
+        return keys[row]
+
     def set_device_hashes(self, device_hashes: set[str]) -> None:
         self._device_hashes = device_hashes
+        # Presence feeds that column's sort key, so it has to be rebuilt.
+        self._sort_keys.pop("on_device", None)
         if self._tracks:
             top_left = self.index(0, 0)
             bottom_right = self.index(len(self._tracks) - 1, 0)
@@ -192,6 +260,9 @@ class TrackTableModel(QAbstractTableModel):
             self._checked_hashes.add(track.hash)
         else:
             self._checked_hashes.discard(track.hash)
+        checked_keys = self._sort_keys.get("checked")
+        if checked_keys is not None:
+            checked_keys[row] = ("1" if checked else "0") + _KEY_SEP + self._tiebreak_at(row)
         index = self.index(row, 0)
         self.dataChanged.emit(index, index, [Qt.DecorationRole])
         if self._on_check_changed:
@@ -218,14 +289,14 @@ class TrackTableModel(QAbstractTableModel):
             if role == Qt.DecorationRole:
                 return checkbox_icon(track.hash in self._checked_hashes)
             if role == Qt.UserRole:
-                return track.hash in self._checked_hashes
+                return self.sort_key_at(index.row(), key)
             return None
 
         if key == "on_device":
             if role == Qt.DecorationRole and track.source_hash in self._device_hashes:
                 return full_presence_icon()
             if role == Qt.UserRole:
-                return track.source_hash in self._device_hashes
+                return self.sort_key_at(index.row(), key)
             return None
 
         if role == Qt.DisplayRole:
@@ -236,13 +307,7 @@ class TrackTableModel(QAbstractTableModel):
             return getattr(track, key)
 
         if role == Qt.UserRole:
-            # The proxy view sorts on this role (see MainWindow._build_table_view,
-            # which sets setSortRole(Qt.UserRole)) instead of the formatted
-            # DisplayRole text above, so numbers and Polish-alphabet text
-            # compare correctly instead of as plain strings.
-            if key in _NUMERIC_COLUMNS:
-                return _numeric_sort_key(getattr(track, key))
-            return polish_sort_key(str(getattr(track, key) or ""))
+            return self.sort_key_at(index.row(), key)
 
         return None
 
@@ -265,7 +330,11 @@ class TrackFilterProxyModel(QSortFilterProxyModel):
         if needle == self._needle:
             return
         self._needle = needle
-        self.invalidateFilter()
+        # Safe to re-run acceptance against the mapping already built rather
+        # than rebuilding it: TrackTableModel.sort_key_at gives the table a
+        # total order, so rows a widened query re-admits go back to their one
+        # correct position instead of landing wherever a tie left them.
+        self.invalidateRowsFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         if not self._needle:

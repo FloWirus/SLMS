@@ -173,9 +173,22 @@ class MainWindow(QMainWindow):
         self.settings.save(self.project_root)
         super().closeEvent(event)
 
+    @staticmethod
+    def _clear_sort_indicator(view: QTableView) -> None:
+        """Leave the table unsorted, so it shows source order (artist, album,
+        disc, track -- see MusicDatabase.all_tracks). Clicking a header still
+        sorts; this only removes the meaningless startup sort on column 0."""
+        view.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
+        view.model().sort(-1)
+
     def _restore_header_states(self):
         self._restore_header_state(self.table_view.horizontalHeader(), self.settings.table_header_state)
         self._restore_header_state(self.device_table_view.horizontalHeader(), self.settings.device_table_header_state)
+        # A header state saved by an earlier version carries that column-0
+        # sort with it; restoring it would put the bug straight back.
+        for view in (self.table_view, self.device_table_view):
+            if view.horizontalHeader().sortIndicatorSection() == 0:
+                self._clear_sort_indicator(view)
         self._restore_header_state(self.tree_widget.header(), self.settings.tree_header_state)
         self._restore_header_state(self.device_tree_widget.header(), self.settings.device_tree_header_state)
 
@@ -212,11 +225,8 @@ class MainWindow(QMainWindow):
         self.table_model = self.table_view.model().sourceModel()
         self.proxy_model = self.table_view.model()
         self.tree_widget = self._build_tree_widget(self._tree_context_menu, self._edit_tree_item)
-        source_pane, self.source_check_all_btn, self.source_search_edit = self._build_pane(
+        source_pane, self.source_check_all_btn = self._build_pane(
             tr("pane_source_title"), self.table_view, self.tree_widget, self._toggle_check_all_source
-        )
-        self.source_search_edit.textChanged.connect(
-            lambda text: self._apply_search_filter(text, self.proxy_model, self.tree_widget)
         )
         self.source_stats_label = QLabel()
         source_pane.layout().addWidget(self.source_stats_label)
@@ -232,14 +242,11 @@ class MainWindow(QMainWindow):
         self.device_table_model = self.device_table_view.model().sourceModel()
         self.device_proxy_model = self.device_table_view.model()
         self.device_tree_widget = self._build_tree_widget(self._device_tree_context_menu, self._edit_device_tree_item)
-        device_pane, self.device_check_all_btn, self.device_search_edit = self._build_pane(
+        device_pane, self.device_check_all_btn = self._build_pane(
             tr("pane_device_title"),
             self.device_table_view,
             self.device_tree_widget,
             self._toggle_check_all_device,
-        )
-        self.device_search_edit.textChanged.connect(
-            lambda text: self._apply_search_filter(text, self.device_proxy_model, self.device_tree_widget)
         )
         self.device_stats_label = QLabel()
         self.device_stats_separator = QLabel("|")
@@ -264,6 +271,10 @@ class MainWindow(QMainWindow):
         device_pane.layout().addLayout(self._device_status_row)
         self._clear_device_status()
         splitter.addWidget(device_pane)
+
+        # Built after both panes, since it filters them both, then inserted
+        # above the splitter -- index 1 puts it directly under the toolbar.
+        layout.insertWidget(1, self._build_search_bar(), 0)
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
@@ -506,20 +517,40 @@ class MainWindow(QMainWindow):
 
         return grid
 
+    def _build_search_bar(self) -> QWidget:
+        """The one search box, sitting above both panes and filtering them
+        together. A single query for the library and the device is what you
+        actually want when comparing the two sides: type an artist once and
+        both panes narrow to it, so what's missing on the device is visible
+        side by side instead of needing the same thing typed twice."""
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel(tr("search_label")), 0)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText(tr("search_placeholder"))
+        # The built-in clear button is the only affordance here: filtering is
+        # live on every keystroke, so there is no button to press to search.
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._on_search_text_changed)
+        row.addWidget(self.search_edit, 1)
+        return bar
+
+    def _on_search_text_changed(self, text: str):
+        """Both panes filter off the same box. Each side keeps its own proxy,
+        tree and debounce timer, so an empty device pane costs nothing here
+        and the two stay independent apart from sharing the query."""
+        self._apply_search_filter(text, self.proxy_model, self.tree_widget)
+        self._apply_search_filter(text, self.device_proxy_model, self.device_tree_widget)
+
     def _build_pane(
         self, title: str, table_view: QTableView, tree_widget: QTreeWidget, toggle_check_all_handler
-    ) -> tuple[QWidget, QPushButton, QLineEdit]:
+    ) -> tuple[QWidget, QPushButton]:
         pane = QWidget()
         pane_layout = QVBoxLayout(pane)
         pane_layout.setContentsMargins(0, 0, 0, 0)
         pane_layout.addWidget(QLabel(f"<b>{title}</b>"), 0)
-
-        search_edit = QLineEdit()
-        search_edit.setPlaceholderText(tr("search_placeholder"))
-        # The built-in clear button is the only affordance here: filtering is
-        # live on every keystroke, so there is no button to press to search.
-        search_edit.setClearButtonEnabled(True)
-        pane_layout.addWidget(search_edit, 0)
 
         tabs = QTabWidget()
         tabs.addTab(table_view, tr("tab_table"))
@@ -535,7 +566,7 @@ class MainWindow(QMainWindow):
         check_all_btn.clicked.connect(toggle_check_all_handler)
         check_row.addWidget(check_all_btn)
         pane_layout.addLayout(check_row)
-        return pane, check_all_btn, search_edit
+        return pane, check_all_btn
 
     def _build_table_view(self, presence_label: str, checked_hashes: set[str], on_check_changed) -> QTableView:
         view = QTableView()
@@ -552,6 +583,16 @@ class MainWindow(QMainWindow):
         # filter-column/case settings apply here.
         view.setModel(proxy_model)
         view.setSortingEnabled(True)
+        # setSortingEnabled immediately sorts by whatever the header's
+        # default indicator points at, which is column 0 -- the "\u2713"
+        # checkbox column, whose sort key is just whether a row is checked.
+        # Nearly every row ties there, and Qt's sort is not stable, so tied
+        # rows came back from a filter change in whatever order the algorithm
+        # left them: searching "coma" then clearing stacked the Coma tracks
+        # above A..., B... Dropping the indicator leaves the proxy unsorted,
+        # which is what the default view actually wants -- all_tracks()
+        # already returns rows ordered by artist, album, disc, track.
+        self._clear_sort_indicator(view)
         view.setColumnWidth(0, 28)
         view.setSelectionBehavior(QAbstractItemView.SelectRows)
         view.setEditTriggers(QAbstractItemView.NoEditTriggers)

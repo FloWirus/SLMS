@@ -2,7 +2,8 @@ _current_language = "en"
 
 TRANSLATIONS = {
     "en": {
-        "search_placeholder": "Search tracks…",
+        "search_label": "Search:",
+        "search_placeholder": "Filter the library and the device by artist, album, title…",
         "menu_edit_selected_tags": "Edit tags of {count} selected tracks…",
         "tab_table": "Table",
         "tab_tree": "Tree",
@@ -267,7 +268,8 @@ TRANSLATIONS = {
         "log_deleted_from_device": "Deleted from device: {path}",
     },
     "pl": {
-        "search_placeholder": "Szukaj utworów…",
+        "search_label": "Szukaj:",
+        "search_placeholder": "Filtruj bibliotekę i nośnik po artyście, albumie, tytule…",
         "menu_edit_selected_tags": "Edytuj tagi zaznaczonych utworów ({count})…",
         "tab_table": "Tabela",
         "tab_tree": "Drzewo",
