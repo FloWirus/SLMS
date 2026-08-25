@@ -61,6 +61,8 @@ class CoverTagDialogBase(QDialog):
         # The in-flight Tidal lookup, if any. Owned by the request itself
         # (see TidalCoverRequest) -- this is only a handle for cancelling it.
         self._tidal_request: TidalCoverRequest | None = None
+        # The (artist, album) the running lookup was started with.
+        self._tidal_query: tuple[str, str] = ("", "")
 
     # ---------- construction ----------
 
@@ -209,6 +211,9 @@ class CoverTagDialogBase(QDialog):
         # dialog being closed mid-request (see TidalCoverRequest), and the
         # result is dropped rather than applied if it no longer belongs to
         # what is on screen.
+        # Kept so the confirmation dialog can show what the search actually
+        # ran with, and offer to re-run it with something else.
+        self._tidal_query = (artist, album)
         self._tidal_request = TidalCoverRequest(
             artist, album, TIDAL_COVER_SIZE, self._on_tidal_cover_finished
         )
@@ -242,13 +247,16 @@ class CoverTagDialogBase(QDialog):
             QMessageBox.warning(self, tr("error_tidal_cover_title"), tr("error_tidal_cover_text", error=error))
             return
 
-        cover_bytes, mime = normalize_manual_cover(data, ".jpg")
-        new_pixmap = QPixmap()
-        new_pixmap.loadFromData(cover_bytes)
-
-        confirm = CoverCompareDialog(self._cover_pixmap, new_pixmap, self)
+        artist, album = self._tidal_query
+        confirm = CoverCompareDialog(self._cover_pixmap, data, artist, album, TIDAL_COVER_SIZE, self)
         if confirm.exec() != QDialog.Accepted:
             return
+
+        # Not necessarily the cover that was handed to the dialog: its own
+        # "Search again" may have replaced the candidate with a better match.
+        cover_bytes, mime = normalize_manual_cover(confirm.cover_bytes, ".jpg")
+        new_pixmap = QPixmap()
+        new_pixmap.loadFromData(cover_bytes)
 
         self._new_cover_bytes = cover_bytes
         self._new_cover_mime = mime
