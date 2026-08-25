@@ -44,6 +44,7 @@ from ..db import MusicDatabase, Track, device_db_path, library_db_path
 from ..i18n import set_language, tr
 from ..scanner import hash_file, scan_directory
 from ..settings import Settings
+from ..tidal_cover import set_search_countries
 from ..sync import (
     ConflictResolution,
     SyncResult,
@@ -133,6 +134,13 @@ class _TransferProgressDialog(QDialog):
 
 
 APP_NAME = "SLMS"
+
+# Headroom kept free on the device when checking whether a sync fits. Filling
+# a card to the last byte is how FAT/exFAT writes start failing in confusing
+# ways, and the size estimate itself is only as good as the source files'
+# sizes -- tags rewritten on the device, filesystem overhead per file and
+# cluster rounding all cost a little more than the sum of the bytes.
+FREE_SPACE_RESERVE = 32 * 1024 * 1024
 
 
 class MainWindow(QMainWindow):
@@ -1473,7 +1481,7 @@ class MainWindow(QMainWindow):
                 return
             cover_resize = CoverResizeSettings(max_size=int(size_text), dpi=int(dpi_text))
 
-        if not self._confirm_free_space(tracks):
+        if not self._confirm_free_space(tracks, force=self.force_checkbox.isChecked()):
             return
 
         reply = QMessageBox.question(
@@ -1524,27 +1532,50 @@ class MainWindow(QMainWindow):
 
         self._show_sync_result(result)
 
-    def _confirm_free_space(self, tracks: list[Track]) -> bool:
-        """Check up front that the tracks about to be copied plausibly fit on
-        the device, instead of discovering it one ENOSPC at a time half-way
-        through a sync and handing back a list of a thousand identical errors.
+    def _tracks_to_be_copied(self, tracks: list[Track], force: bool) -> list[Track]:
+        """The subset of `tracks` a sync would actually write to the device.
 
-        An estimate on purpose, hence a warning the user can override rather
-        than a hard stop: tracks already on the device won't be copied again,
-        and conversion usually makes files smaller -- so this over-counts,
-        and being wrong in that direction must not block a sync that would
+        Anything the device already holds (matched the same way the presence
+        tick is, on the source file's hash) is skipped by the sync itself, so
+        counting it would report a library-sized transfer every time someone
+        re-syncs a card that is already up to date. With Force everything is
+        re-written, so everything counts."""
+        if force or not self.device_hashes:
+            return list(tracks)
+        return [track for track in tracks if track.source_hash not in self.device_hashes]
+
+    def _confirm_free_space(self, tracks: list[Track], force: bool) -> bool:
+        """Check up front that what is about to be copied fits on the device,
+        instead of discovering it one ENOSPC at a time half-way through and
+        handing back a list of a thousand identical errors.
+
+        Still a warning the user can override rather than a hard stop: the
+        figure is an estimate. Conversion and cover resizing change file
+        sizes (usually downwards) and the device's filesystem has overheads
+        of its own, so being slightly wrong must not block a sync that would
         actually have fit."""
-        needed = sum(track.size for track in tracks)
+        pending = self._tracks_to_be_copied(tracks, force)
+        needed = sum(track.size for track in pending)
+        if not needed:
+            return True
         try:
             free = shutil.disk_usage(self.selected_device.mountpoint).free
         except OSError:
+            # No usage figures (an odd filesystem, a device unplugged between
+            # picking it and pressing Sync) is not grounds for refusing to
+            # try -- the copy itself will report what actually happens.
             return True
-        if needed <= free:
+        if needed + FREE_SPACE_RESERVE <= free:
             return True
         reply = QMessageBox.warning(
             self,
             tr("msg_not_enough_space_title"),
-            tr("msg_not_enough_space_text", needed=format_size(needed), free=format_size(free)),
+            tr(
+                "msg_not_enough_space_text",
+                count=len(pending),
+                needed=format_size(needed),
+                free=format_size(free),
+            ),
             QMessageBox.Yes | QMessageBox.No,
         )
         return reply == QMessageBox.Yes
@@ -2209,3 +2240,7 @@ class MainWindow(QMainWindow):
             self.settings = dialog.updated_settings()
             self.settings.save(self.project_root)
             apply_theme(QApplication.instance(), self.settings.theme)
+            # Cover lookups read the region list off the module, so a changed
+            # selection has to be pushed there to take effect without a
+            # restart.
+            set_search_countries(self.settings.tidal_countries)

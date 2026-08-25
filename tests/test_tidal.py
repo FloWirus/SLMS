@@ -83,3 +83,48 @@ def test_a_rejected_token_is_reported_as_unavailable(monkeypatch):
 
 def test_cover_url():
     assert tidal_cover.cover_url("aaaa-bbbb-cccc", 640).endswith("/aaaa/bbbb/cccc/640x640.jpg")
+
+
+def test_set_search_countries_applies_the_selection(monkeypatch):
+    monkeypatch.setattr(tidal_cover, "SEARCH_COUNTRIES", tidal_cover.DEFAULT_SEARCH_COUNTRIES)
+    assert tidal_cover.set_search_countries(["DE", "PL"]) == ("DE", "PL")
+    assert tidal_cover.SEARCH_COUNTRIES == ("DE", "PL")
+
+
+def test_set_search_countries_drops_unknown_codes_and_duplicates(monkeypatch):
+    monkeypatch.setattr(tidal_cover, "SEARCH_COUNTRIES", tidal_cover.DEFAULT_SEARCH_COUNTRIES)
+    assert tidal_cover.set_search_countries(["PL", "ZZ", "PL", "US"]) == ("PL", "US")
+
+
+def test_an_empty_selection_falls_back_to_the_defaults(monkeypatch):
+    """Otherwise a stale settings file (or a catalogue Tidal dropped) would
+    turn cover search into a feature that quietly finds nothing."""
+    monkeypatch.setattr(tidal_cover, "SEARCH_COUNTRIES", ("PL",))
+    assert tidal_cover.set_search_countries([]) == tidal_cover.DEFAULT_SEARCH_COUNTRIES
+    assert tidal_cover.set_search_countries(["ZZ"]) == tidal_cover.DEFAULT_SEARCH_COUNTRIES
+
+
+def test_lookups_query_exactly_the_configured_regions(monkeypatch):
+    monkeypatch.setattr(tidal_cover, "SEARCH_COUNTRIES", tidal_cover.DEFAULT_SEARCH_COUNTRIES)
+    tidal_cover.set_search_countries(["PL", "DE", "BR"])
+    asked = []
+
+    def search(query, country):
+        asked.append(country)
+        return [album(1, "Album", "Artist")]
+
+    monkeypatch.setattr(tidal_cover, "_search", search)
+    tidal_cover.find_album("Artist", "Album")
+    assert asked == ["PL", "DE", "BR"]
+
+
+def test_every_region_lists_only_known_two_letter_codes():
+    codes = [code for group in tidal_cover.COUNTRY_REGIONS.values() for code in group]
+    assert len(codes) == len(set(codes)), "a country is listed in two regions"
+    assert all(len(code) == 2 and code.isupper() for code in codes)
+    assert set(tidal_cover.DEFAULT_SEARCH_COUNTRIES) <= tidal_cover.KNOWN_COUNTRIES
+
+
+def test_country_name_is_readable():
+    assert tidal_cover.country_name("PL").startswith("PL")
+    assert "Poland" in tidal_cover.country_name("PL")

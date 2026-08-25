@@ -30,19 +30,58 @@ SEARCH_LIMIT = 20
 # on purpose: PL covers Polish releases, US covers the international
 # mainstream. Add a code below only if albums are actually being missed.
 #
-# countryCode takes an ISO 3166-1 alpha-2 code; Tidal serves a catalog for
-# roughly the markets it operates in, which at time of writing are:
-#
-#   Europe:   AT BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LT
-#             LU LV MT NL NO PL PT RO RS SE SI SK UA
-#   Americas: AR BR CA CL CO DO JM MX PE PR US
-#   APAC:     AU HK MY NZ SG TH
-#   MEA:      AE IL NG TR UG ZA
-#
-# (Tidal changes markets over time -- an unsupported code doesn't error, it
-# just comes back with no items, so an outdated entry costs a wasted request
-# rather than a failure.)
-SEARCH_COUNTRIES = ("PL", "US", "FI")
+# countryCode takes an ISO 3166-1 alpha-2 code; the catalogue below is
+# roughly the markets Tidal operates in, grouped the way the settings dialog
+# presents them. Tidal changes markets over time -- an unsupported code
+# doesn't error, it just comes back with no items, so an outdated entry
+# costs a wasted request rather than a failure.
+COUNTRY_REGIONS: dict[str, tuple[str, ...]] = {
+    "region_europe": (
+        "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR",
+        "GB", "GR", "HR", "HU", "IE", "IS", "IT", "LT", "LU", "LV", "MT", "NL",
+        "NO", "PL", "PT", "RO", "RS", "SE", "SI", "SK", "UA",
+    ),
+    "region_americas": ("AR", "BR", "CA", "CL", "CO", "DO", "JM", "MX", "PE", "PR", "US"),
+    "region_apac": ("AU", "HK", "MY", "NZ", "SG", "TH"),
+    "region_mea": ("AE", "IL", "NG", "TR", "UG", "ZA"),
+}
+KNOWN_COUNTRIES = frozenset(code for codes in COUNTRY_REGIONS.values() for code in codes)
+
+# What gets queried when the user hasn't picked anything else: PL covers
+# Polish releases, US the international mainstream, FI catches Nordic
+# releases the other two miss. Kept short on purpose -- every extra region is
+# one more sequential HTTP round-trip per lookup, and regional catalogues
+# overlap heavily.
+DEFAULT_SEARCH_COUNTRIES = ("PL", "US", "FI")
+
+# The regions actually queried, pooled before ranking. Replaced at startup
+# (and whenever the setting changes) via set_search_countries(); still a
+# plain module global so a caller can override it directly.
+SEARCH_COUNTRIES = DEFAULT_SEARCH_COUNTRIES
+
+
+def set_search_countries(codes) -> tuple[str, ...]:
+    """Set which regional catalogues cover lookups query, and return what was
+    actually applied.
+
+    Unknown codes are dropped and an empty selection falls back to the
+    defaults: a settings file listing only regions Tidal has since dropped
+    (or nothing at all) must not turn cover search into a feature that
+    silently finds nothing."""
+    global SEARCH_COUNTRIES
+    selected = tuple(dict.fromkeys(code for code in codes if code in KNOWN_COUNTRIES))
+    SEARCH_COUNTRIES = selected or DEFAULT_SEARCH_COUNTRIES
+    return SEARCH_COUNTRIES
+
+
+def country_name(code: str) -> str:
+    """Readable name for an ISO code, from Qt's own locale data -- "PL" alone
+    is not something anyone should have to decode in a checkbox list."""
+    from PySide6.QtCore import QLocale
+
+    territory = QLocale.codeToTerritory(code)
+    name = QLocale.territoryToString(territory)
+    return f"{code} — {name}" if name else code
 # Once candidates are within this margin of the best text-match score,
 # they're treated as an equally valid textual match (e.g. a single and the
 # album it's later folded into both containing the same title word) and

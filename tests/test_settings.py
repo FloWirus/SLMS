@@ -55,3 +55,12 @@ def test_unknown_keys_are_ignored(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"from_a_future_version": True}))
     assert Settings.load(tmp_path) == Settings()
+
+
+def test_tidal_countries_default_and_roundtrip(tmp_path):
+    from music_sync.tidal_cover import DEFAULT_SEARCH_COUNTRIES
+
+    assert Settings().tidal_countries == list(DEFAULT_SEARCH_COUNTRIES)
+    settings = Settings(tidal_countries=["DE", "PL"])
+    settings.save(tmp_path)
+    assert Settings.load(tmp_path).tidal_countries == ["DE", "PL"]

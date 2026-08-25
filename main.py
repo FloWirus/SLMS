@@ -24,6 +24,7 @@ from music_sync.gui.main_window import MainWindow
 from music_sync.gui.theme import apply_theme, init as init_theme
 from music_sync.i18n import set_language, tr
 from music_sync.settings import Settings
+from music_sync.tidal_cover import set_search_countries
 
 
 def _migrate_legacy_data_dir(project_root: Path, data_dir: Path) -> None:
@@ -56,9 +57,13 @@ def main():
     data_dir = app_data_dir()
     _migrate_legacy_data_dir(project_root, data_dir)
 
+    settings = Settings.load(data_dir)
     # Set before the first log call so even this startup message respects the
     # saved language (MainWindow re-applies it later; it's the same value).
-    set_language(Settings.load(data_dir).language)
+    set_language(settings.language)
+    # Cover lookups read this straight off the module, so the saved choice
+    # has to be applied before any dialog can start one.
+    set_search_countries(settings.tidal_countries)
     logger.info(tr("log_starting", data_dir=data_dir))
 
     app = QApplication(sys.argv)

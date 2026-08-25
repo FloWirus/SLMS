@@ -17,6 +17,7 @@ from .. import converter
 from ..i18n import available_languages, tr
 from ..settings import Settings
 from ..templating import validate_template
+from .tidal_regions_dialog import TidalRegionsDialog
 
 
 class SettingsDialog(QDialog):
@@ -67,6 +68,13 @@ class SettingsDialog(QDialog):
         self.track_no_fix_checkbox.setToolTip(tr("chk_track_no_fix_tooltip"))
         form.addRow("", self.track_no_fix_checkbox)
 
+        self._tidal_countries = list(self._settings.tidal_countries)
+        self.tidal_regions_btn = QPushButton()
+        self.tidal_regions_btn.setToolTip(tr("btn_tidal_regions_tooltip"))
+        self.tidal_regions_btn.clicked.connect(self._edit_tidal_regions)
+        self._update_tidal_regions_button()
+        form.addRow(tr("label_tidal_regions"), self.tidal_regions_btn)
+
         layout.addLayout(form)
 
         help_row = QHBoxLayout()
@@ -82,6 +90,21 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._on_save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _update_tidal_regions_button(self):
+        # The count on the button is the point: this is the one setting where
+        # picking more costs time on every single lookup (one HTTP request
+        # per region), so how many are on has to be visible without opening
+        # the dialog.
+        self.tidal_regions_btn.setText(
+            tr("btn_tidal_regions", count=len(self._tidal_countries))
+        )
+
+    def _edit_tidal_regions(self):
+        dialog = TidalRegionsDialog(self._tidal_countries, self)
+        if dialog.exec():
+            self._tidal_countries = dialog.selected_countries()
+            self._update_tidal_regions_button()
 
     def _show_tag_help(self):
         QMessageBox.information(self, tr("tag_help_title"), tr("tag_help_text"))
@@ -114,6 +137,7 @@ class SettingsDialog(QDialog):
             theme=self.theme_combo.currentData(),
             use_libsoxr=self.libsoxr_checkbox.isChecked(),
             track_no_fix=self.track_no_fix_checkbox.isChecked(),
+            tidal_countries=list(self._tidal_countries),
         )
 
 

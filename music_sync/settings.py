@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from .constants import DEFAULT_DIR_TEMPLATE, DEFAULT_FILENAME_TEMPLATE, DB_DIRNAME, SETTINGS_FILENAME
+from .tidal_cover import DEFAULT_SEARCH_COUNTRIES
 
 
 @dataclass
@@ -15,6 +16,9 @@ class Settings:
     theme: str = "auto"
     use_libsoxr: bool = False
     track_no_fix: bool = False
+    # ISO codes of the regional Tidal catalogues cover lookups query; see
+    # tidal_cover.COUNTRY_REGIONS.
+    tidal_countries: list[str] = field(default_factory=lambda: list(DEFAULT_SEARCH_COUNTRIES))
     profiles: list[dict] = field(default_factory=list)
     last_profile_name: str = ""
     table_header_state: str = ""
