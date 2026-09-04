@@ -19,12 +19,23 @@ class Settings:
     # ISO codes of the regional Tidal catalogues cover lookups query; see
     # tidal_cover.COUNTRY_REGIONS.
     tidal_countries: list[str] = field(default_factory=lambda: list(DEFAULT_SEARCH_COUNTRIES))
+    # Where resized covers are cached: with the music library ("[Covers]/"
+    # folders next to the albums) or in the app's own data directory.
+    cover_cache_in_library: bool = True
     profiles: list[dict] = field(default_factory=list)
     last_profile_name: str = ""
     table_header_state: str = ""
     device_table_header_state: str = ""
     tree_header_state: str = ""
     device_tree_header_state: str = ""
+    # Which artists are collapsed / albums opened in each tree view, so the
+    # shape a user arranged survives closing the app (see
+    # MainWindow._tree_expansion_state). Only the deviations from the default
+    # shape are stored, so newly scanned albums still get the default.
+    tree_collapsed_artists: list[str] = field(default_factory=list)
+    tree_expanded_albums: list[list[str]] = field(default_factory=list)
+    device_tree_collapsed_artists: list[str] = field(default_factory=list)
+    device_tree_expanded_albums: list[list[str]] = field(default_factory=list)
 
     @staticmethod
     def load(project_root: Path) -> "Settings":

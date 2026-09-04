@@ -68,6 +68,11 @@ class SettingsDialog(QDialog):
         self.track_no_fix_checkbox.setToolTip(tr("chk_track_no_fix_tooltip"))
         form.addRow("", self.track_no_fix_checkbox)
 
+        self.cover_cache_checkbox = QCheckBox(tr("chk_cover_cache_in_library"))
+        self.cover_cache_checkbox.setChecked(self._settings.cover_cache_in_library)
+        self.cover_cache_checkbox.setToolTip(tr("chk_cover_cache_in_library_tooltip"))
+        form.addRow("", self.cover_cache_checkbox)
+
         self._tidal_countries = list(self._settings.tidal_countries)
         self.tidal_regions_btn = QPushButton()
         self.tidal_regions_btn.setToolTip(tr("btn_tidal_regions_tooltip"))
@@ -138,6 +143,7 @@ class SettingsDialog(QDialog):
             use_libsoxr=self.libsoxr_checkbox.isChecked(),
             track_no_fix=self.track_no_fix_checkbox.isChecked(),
             tidal_countries=list(self._tidal_countries),
+            cover_cache_in_library=self.cover_cache_checkbox.isChecked(),
         )
 
 

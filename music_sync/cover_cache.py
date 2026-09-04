@@ -2,24 +2,23 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
-from .constants import app_data_dir
+from .constants import DB_DIRNAME, app_data_dir
 
 COVERS_DB_FILENAME = "covers.db"
-COVERS_DIRNAME = "covers"
+# Where the cache keeps its files when it lives in the app's data directory.
+APP_COVERS_DIRNAME = "covers"
+# ...and the per-album folder it uses when it lives next to the music. Named
+# in brackets so it sorts to the top of an album directory and reads as "not
+# one of the music files".
+ALBUM_COVERS_DIRNAME = "[Covers]"
 
 
-def covers_dir() -> Path:
-    """Where resized cover art is cached.
+def app_covers_dir() -> Path:
+    return app_data_dir() / APP_COVERS_DIRNAME
 
-    Under the app's own data directory, not inside the music library. The
-    cache used to write a music_db/covers.db plus a "[Covers]/" folder into
-    every album directory it touched -- files the user never asked for, in a
-    library this app otherwise only reads from, and left behind for good once
-    the resize settings changed. Nothing about a resized cover depends on
-    where the source file lives (it is keyed by the artwork's own hash), so
-    it belongs with the app's data.
-    """
-    return app_data_dir() / COVERS_DIRNAME
+
+def library_covers_db_path(source_root: Path) -> Path:
+    return Path(source_root) / DB_DIRNAME / COVERS_DB_FILENAME
 
 
 def hash_cover(cover_bytes: bytes) -> str:
@@ -27,24 +26,36 @@ def hash_cover(cover_bytes: bytes) -> str:
 
 
 class CoverCache:
-    """Resized cover art, cached as files under the app's data directory and
-    indexed by (raw cover hash, resize params) in a small sqlite database.
+    """Resized cover art, kept as files and indexed by (raw cover hash, resize
+    params) in a small sqlite database.
 
     Resizing the same artwork again -- across the tracks of an album, repeat
     syncs, a forced re-sync, or a second device -- then costs a file read
-    instead of a decode plus a rescale.
+    instead of a decode plus a rescale. Keyed by the *source artwork's* hash,
+    so a cached result is equally valid for every sync target.
 
-    Keyed by the *source artwork's* hash, so the cache is equally valid for
-    every device and survives the library being moved or renamed. Artwork the
-    user put in an album directory (cover.jpg, folder.png) is a source: it is
-    read in place by album_covers.read_loose_cover() and never moved, renamed
-    or deleted.
+    Two layouts, chosen by the "keep the cache with the music library"
+    setting:
+
+    * next to the library (the default): the index goes to
+      `<library>/music_db/covers.db` and each resized file into a
+      `[Covers]/` folder inside whichever directory holds that album's audio
+      -- so the results sit with the music they belong to, visible in a file
+      manager, and travel with the library if it is copied elsewhere;
+    * in the app's data directory: `~/.local/share/SLMS/covers/`, leaving the
+      music library untouched by anything this app writes.
+
+    Either way, artwork the user put in an album directory (cover.jpg,
+    folder.png) is a *source*: read in place by
+    album_covers.read_loose_cover() and never moved, renamed or deleted.
+    `[Covers]/` holds resize output and nothing else.
     """
 
-    def __init__(self, root: Path | None = None):
-        self.source_root = Path(root) if root is not None else covers_dir()
-        self.db_path = self.source_root / COVERS_DB_FILENAME
-        self.source_root.mkdir(parents=True, exist_ok=True)
+    def __init__(self, root: Path, db_path: Path, per_album: bool = False):
+        self.root = Path(root)
+        self.db_path = Path(db_path)
+        self.per_album = per_album
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.execute(
             """
@@ -72,25 +83,58 @@ class CoverCache:
             return None
         mime, rel_path = row
         try:
-            return (self.source_root / rel_path).read_bytes(), mime
+            return (self.root / rel_path).read_bytes(), mime
         except OSError:
             # Cached file was deleted/moved out from under us -- fall back to
             # recomputing rather than erroring the sync.
             return None
 
-    def put(self, source_hash: str, max_size: int, dpi: int, mime: str, resized_bytes: bytes) -> None:
-        # Fanned out over one level of subdirectories named by the hash's
-        # first two characters: a large library resized at a couple of
-        # settings puts thousands of files here, and every file manager and
-        # filesystem is happier with 256 directories than one huge one.
-        bucket = self.source_root / source_hash[:2]
-        bucket.mkdir(parents=True, exist_ok=True)
+    def put(
+        self,
+        source_hash: str,
+        max_size: int,
+        dpi: int,
+        mime: str,
+        resized_bytes: bytes,
+        album_dir: Path | None = None,
+    ) -> Path | None:
+        """Store one resized cover and return where it was written.
+
+        `album_dir` is where the source album's audio lives; it decides the
+        `[Covers]/` location in per-album mode and is ignored otherwise.
+        Returns None if the file could not be written -- a read-only library,
+        say -- since the sync itself must not fail over a cache miss.
+        """
+        directory = self._directory_for(source_hash, album_dir)
         ext = "png" if mime == "image/png" else "jpg"
-        file_path = bucket / f"{source_hash[:16]}_{max_size}_{dpi}.{ext}"
-        file_path.write_bytes(resized_bytes)
-        rel_path = file_path.relative_to(self.source_root)
+        file_path = directory / f"{source_hash[:16]}_{max_size}_{dpi}.{ext}"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(resized_bytes)
+            rel_path = file_path.relative_to(self.root)
+        except (OSError, ValueError):
+            return None
         self.conn.execute(
             "INSERT OR REPLACE INTO cover_cache (source_hash, max_size, dpi, mime, file_path) VALUES (?, ?, ?, ?, ?)",
             (source_hash, max_size, dpi, mime, str(rel_path)),
         )
         self.conn.commit()
+        return file_path
+
+    def _directory_for(self, source_hash: str, album_dir: Path | None) -> Path:
+        if self.per_album and album_dir is not None:
+            return Path(album_dir) / ALBUM_COVERS_DIRNAME
+        # Fanned out over one level of subdirectories named by the hash's
+        # first two characters: a whole library resized at a couple of
+        # settings puts thousands of files in one place otherwise, and both
+        # file managers and filesystems are happier with 256 directories.
+        return self.root / source_hash[:2]
+
+
+def open_cover_cache(source_root: Path, in_library: bool) -> CoverCache:
+    """The cache for a sync out of `source_root`, in whichever of the two
+    layouts the setting asks for (see CoverCache)."""
+    if in_library:
+        return CoverCache(source_root, library_covers_db_path(source_root), per_album=True)
+    root = app_covers_dir()
+    return CoverCache(root, root / COVERS_DB_FILENAME)

@@ -13,7 +13,7 @@ from . import tags as tagsmod
 from .album_covers import read_loose_cover
 from .constants import AUDIO_EXTENSIONS
 from .converter import ConversionSettings, CoverResizeSettings, convert_file, decide_conversion
-from .cover_cache import CoverCache, hash_cover
+from .cover_cache import CoverCache, hash_cover, open_cover_cache
 from .cover_utils import read_image_info, resize_cover_bytes
 from .db import MusicDatabase, Track, device_db_path
 from .i18n import tr
@@ -145,6 +145,7 @@ def sync_to_device(
     on_scan_progress: ScanProgressCallback | None = None,
     force: bool = False,
     should_stop: ShouldStopCallback | None = None,
+    cover_cache_in_library: bool = True,
 ) -> SyncResult:
     device_mountpoint = Path(device_mountpoint)
     device_db = MusicDatabase(device_db_path(device_mountpoint))
@@ -164,6 +165,7 @@ def sync_to_device(
             on_scan_progress,
             force,
             should_stop,
+            cover_cache_in_library,
         )
     finally:
         # In a finally, not after the call: a sync that dies half-way (a card
@@ -214,6 +216,7 @@ def _copy_tracks(
     on_scan_progress: ScanProgressCallback | None = None,
     force: bool = False,
     should_stop: ShouldStopCallback | None = None,
+    cover_cache_in_library: bool = True,
 ) -> SyncResult:
     source_root = Path(source_root)
     target_root = Path(target_root)
@@ -234,10 +237,12 @@ def _copy_tracks(
     target_source_hashes = target_db.source_hashes()
 
     # Only relevant for PC -> device syncs (sync_from_device never passes
-    # cover_resize). Keyed by source cover hash and kept in the app's own
-    # data directory, so it is shared across tracks, albums, repeat syncs
-    # and devices -- see CoverCache.
-    cover_cache = CoverCache() if cover_resize is not None else None
+    # cover_resize). Keyed by the source cover's hash, so it is shared across
+    # tracks, albums, repeat syncs and devices; where its files land is the
+    # user's choice -- see CoverCache.
+    cover_cache = (
+        open_cover_cache(source_root, cover_cache_in_library) if cover_resize is not None else None
+    )
     # Which cover to resize from is picked per album (best quality found
     # across all of the album's tracks' own tags plus any loose [Covers]
     # file), not just the one track currently being written -- cache that
@@ -497,7 +502,9 @@ def _resize_target_cover(
         else:
             resized_bytes = resize_cover_bytes(cover_bytes, mime, cover_resize.max_size, cover_resize.dpi)
             if cover_cache is not None:
-                cover_cache.put(source_hash, cover_resize.max_size, cover_resize.dpi, mime, resized_bytes)
+                cover_cache.put(
+                    source_hash, cover_resize.max_size, cover_resize.dpi, mime, resized_bytes, album_dir
+                )
 
         tagsmod.write_cover_art(target_path, resized_bytes, mime)
         return True

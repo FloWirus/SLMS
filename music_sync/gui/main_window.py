@@ -69,6 +69,13 @@ SEARCH_TEXT_ROLE = Qt.UserRole + 1
 # How long typing has to pause before the search actually runs. Long enough
 # to swallow a run of keystrokes, short enough to still feel live.
 SEARCH_DEBOUNCE_MS = 150
+
+# How a tree deviates from its default shape: (artists the user collapsed,
+# albums the user opened). Everything else follows the default -- artists
+# open, albums closed -- which is also what a node nobody has touched yet
+# gets. See MainWindow._tree_expansion_state.
+ExpansionState = tuple[set[str], set[tuple[str, str]]]
+EMPTY_EXPANSION: ExpansionState = (set(), set())
 from .theme import apply_theme
 
 logger = logging.getLogger(__name__)
@@ -167,7 +174,11 @@ class MainWindow(QMainWindow):
         # snapshot taken when filtering started, so clearing the box gives
         # the user back the tree they had rather than a fully expanded one.
         self._tree_filter_text: dict[QTreeWidget, str] = {}
-        self._tree_prefilter_state: dict[QTreeWidget, tuple[set, set]] = {}
+        self._tree_prefilter_state: dict[QTreeWidget, ExpansionState] = {}
+        # Which artists/albums are collapsed or opened in each tree, carried
+        # across rebuilds within a session and across restarts through
+        # settings.json -- see _tree_expansion_state.
+        self._expansion_memory: dict[QTreeWidget, ExpansionState] = {}
         # Debounce timers and the not-yet-applied query per tree, so a burst
         # of keystrokes costs one filter pass -- see _apply_search_filter.
         self._search_debounce: dict[QTreeWidget, QTimer] = {}
@@ -178,6 +189,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._restore_header_states()
+        self._restore_tree_expansion_states()
 
         if self.settings.last_profile_name:
             idx = self.profile_combo.findData(self.settings.last_profile_name)
@@ -195,6 +207,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._save_header_states()
+        self._save_tree_expansion_states()
         self.settings.save(self.project_root)
         # Both handles are explicitly closed rather than left to interpreter
         # shutdown: the device one lives on removable media, where an open
@@ -310,6 +323,58 @@ class MainWindow(QMainWindow):
         sorts; this only removes the meaningless startup sort on column 0."""
         view.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
         view.model().sort(-1)
+
+    # Settings fields holding each tree's remembered shape.
+    _EXPANSION_SETTINGS = {
+        "tree": ("tree_collapsed_artists", "tree_expanded_albums"),
+        "device_tree": ("device_tree_collapsed_artists", "device_tree_expanded_albums"),
+    }
+
+    def _expansion_trees(self):
+        yield self.tree_widget, self._EXPANSION_SETTINGS["tree"]
+        yield self.device_tree_widget, self._EXPANSION_SETTINGS["device_tree"]
+
+    @staticmethod
+    def _expansion_from_settings(collapsed_artists, expanded_albums) -> ExpansionState:
+        """Read a remembered shape back out of settings.json, ignoring
+        anything that isn't the shape it was written in -- the file is
+        hand-editable, and a bad entry here must cost at most one node's
+        remembered state."""
+        artists = {name for name in collapsed_artists if isinstance(name, str)}
+        albums = {
+            (pair[0], pair[1])
+            for pair in expanded_albums
+            if isinstance(pair, (list, tuple)) and len(pair) == 2 and all(isinstance(p, str) for p in pair)
+        }
+        return artists, albums
+
+    @staticmethod
+    def _expansion_to_settings(state: ExpansionState) -> tuple[list[str], list[list[str]]]:
+        """The inverse, sorted so settings.json doesn't churn between saves
+        just because a set iterated in a different order."""
+        collapsed_artists, expanded_albums = state
+        return sorted(collapsed_artists), sorted([artist, album] for artist, album in expanded_albums)
+
+    def _restore_tree_expansion_states(self):
+        for tree_widget, (collapsed_field, expanded_field) in self._expansion_trees():
+            self._expansion_memory[tree_widget] = self._expansion_from_settings(
+                getattr(self.settings, collapsed_field), getattr(self.settings, expanded_field)
+            )
+
+    def _save_tree_expansion_states(self):
+        for tree_widget, (collapsed_field, expanded_field) in self._expansion_trees():
+            # An empty tree (no library chosen, no device connected) says
+            # nothing about what the user had arranged, so the remembered
+            # state is kept rather than blanked by it.
+            if tree_widget.topLevelItemCount():
+                self._expansion_memory[tree_widget] = self._tree_prefilter_state.get(
+                    tree_widget
+                ) or self._tree_expansion_state(tree_widget)
+            collapsed, expanded = self._expansion_to_settings(
+                self._expansion_memory.get(tree_widget, EMPTY_EXPANSION)
+            )
+            setattr(self.settings, collapsed_field, collapsed)
+            setattr(self.settings, expanded_field, expanded)
 
     def _restore_header_states(self):
         self._restore_header_state(self.table_view.horizontalHeader(), self.settings.table_header_state)
@@ -955,36 +1020,41 @@ class MainWindow(QMainWindow):
             return ("album", data.get("artist"), data.get("album"))
         return None
 
-    def _tree_expansion_state(self, tree_widget: QTreeWidget) -> tuple[set, set]:
-        """(keys of every artist/album node present, keys of the expanded
-        ones). Both halves matter on restore: a node that's missing from the
-        first set is new (a rename, or a freshly scanned album) and gets the
-        default state, while a known node absent from the second was
-        deliberately collapsed by the user and must stay that way."""
-        known: set = set()
-        expanded: set = set()
-        for i in range(tree_widget.topLevelItemCount()):
-            artist_item = tree_widget.topLevelItem(i)
-            for item in (artist_item, *(artist_item.child(j) for j in range(artist_item.childCount()))):
-                key = self._tree_node_key(item)
-                if key is None:
-                    continue
-                known.add(key)
-                if item.isExpanded():
-                    expanded.add(key)
-        return known, expanded
+    def _tree_expansion_state(self, tree_widget: QTreeWidget) -> ExpansionState:
+        """How this tree deviates from its default shape: which artists the
+        user collapsed, and which albums they opened.
 
-    def _restore_tree_expansion(self, tree_widget: QTreeWidget, known: set, expanded: set):
+        Stored as the two deltas rather than "everything that is open",
+        because that is what makes a node the tree has never seen -- a
+        rename, a freshly scanned album -- fall into the default (artists
+        open, albums closed) instead of being guessed at. It is also what can
+        be written to settings.json and applied to a tree built from scratch
+        on the next launch."""
+        collapsed_artists: set[str] = set()
+        expanded_albums: set[tuple[str, str]] = set()
         for i in range(tree_widget.topLevelItemCount()):
             artist_item = tree_widget.topLevelItem(i)
-            for depth, item in (
-                (0, artist_item),
-                *((1, artist_item.child(j)) for j in range(artist_item.childCount())),
-            ):
-                key = self._tree_node_key(item)
-                # Default for a node we've never seen matches what
-                # expandToDepth(0) does: artists open, albums closed.
-                item.setExpanded(key in expanded if key in known else depth == 0)
+            artist_key = self._tree_node_key(artist_item)
+            if artist_key and not artist_item.isExpanded():
+                collapsed_artists.add(artist_key[1])
+            for j in range(artist_item.childCount()):
+                album_item = artist_item.child(j)
+                album_key = self._tree_node_key(album_item)
+                if album_key and album_item.isExpanded():
+                    expanded_albums.add((album_key[1], album_key[2]))
+        return collapsed_artists, expanded_albums
+
+    def _restore_tree_expansion(self, tree_widget: QTreeWidget, state: ExpansionState):
+        collapsed_artists, expanded_albums = state
+        for i in range(tree_widget.topLevelItemCount()):
+            artist_item = tree_widget.topLevelItem(i)
+            artist_key = self._tree_node_key(artist_item)
+            artist = artist_key[1] if artist_key else None
+            artist_item.setExpanded(artist not in collapsed_artists)
+            for j in range(artist_item.childCount()):
+                album_item = artist_item.child(j)
+                album_key = self._tree_node_key(album_item)
+                album_item.setExpanded(bool(album_key) and album_key[1:] in expanded_albums)
 
     def _populate_tree(
         self, tree_widget: QTreeWidget, tracks: list[Track], other_hashes: set[str], checked_hashes: set[str]
@@ -993,8 +1063,15 @@ class MainWindow(QMainWindow):
         # user's collapsed artists/albums (and scroll position) across that
         # rebuild, every save snaps the view back to the default layout and
         # loses their place in a large library.
-        known_nodes, expanded_nodes = self._tree_expansion_state(tree_widget)
         had_content = tree_widget.topLevelItemCount() > 0
+        if had_content:
+            # What is on screen right now is only the truth when no search is
+            # narrowing it: filtering force-expands whatever matched, and the
+            # shape the user actually arranged is the snapshot taken when the
+            # search started.
+            self._expansion_memory[tree_widget] = self._tree_prefilter_state.get(
+                tree_widget
+            ) or self._tree_expansion_state(tree_widget)
         scroll_position = tree_widget.verticalScrollBar().value()
 
         self._updating_checks = True
@@ -1047,10 +1124,11 @@ class MainWindow(QMainWindow):
                 self._set_presence_icon(artist_item, artist_present_flags)
                 tree_widget.addTopLevelItem(artist_item)
 
-            if had_content:
-                self._restore_tree_expansion(tree_widget, known_nodes, expanded_nodes)
-            else:
-                tree_widget.expandToDepth(0)
+            # Applied whether or not the tree had content: on the first fill
+            # after startup this is the state restored from settings.json, so
+            # the artists the user left collapsed last time come back
+            # collapsed instead of the whole library unrolling again.
+            self._restore_tree_expansion(tree_widget, self._expansion_memory.get(tree_widget, EMPTY_EXPANSION))
         finally:
             self._updating_checks = False
 
@@ -1109,7 +1187,7 @@ class MainWindow(QMainWindow):
                 (track_item or album_item or artist_item).setHidden(False)
             saved = self._tree_prefilter_state.pop(tree_widget, None)
             if saved:
-                self._restore_tree_expansion(tree_widget, *saved)
+                self._restore_tree_expansion(tree_widget, saved)
             return
 
         # Snapshot the pre-filter shape once, on the keystroke that starts a
@@ -1498,6 +1576,7 @@ class MainWindow(QMainWindow):
         filename_template = self.settings.filename_template
         track_no_fix = self.settings.track_no_fix
         force = self.force_checkbox.isChecked()
+        cover_cache_in_library = self.settings.cover_cache_in_library
 
         def work(ctx):
             # Everything this closure touches was read off the widgets above,
@@ -1517,6 +1596,7 @@ class MainWindow(QMainWindow):
                 on_scan_progress=lambda index, total, path: ctx.progress(index, total, path.name),
                 force=force,
                 should_stop=ctx.should_stop,
+                cover_cache_in_library=cover_cache_in_library,
             )
 
         result = self._run_transfer(work, len(tracks))
@@ -1976,12 +2056,21 @@ class MainWindow(QMainWindow):
 
     def _show_device_track_menu(self, device_track: Track, tracks: list[Track], index: int, global_pos, selected: list[Track] | None = None):
         menu = QMenu(self)
-        multi_edit_action = None
-        if selected and len(selected) > 1 and any(t.path == device_track.path for t in selected):
-            multi_edit_action = menu.addAction(tr("menu_edit_selected_tags", count=len(selected)))
+        # Offered only when the right-clicked row is itself part of the
+        # highlighted selection -- right-clicking outside it is a gesture
+        # about that one row, not about what's highlighted elsewhere.
+        is_multi = bool(selected) and len(selected) > 1 and any(t.path == device_track.path for t in selected)
+        multi_edit_action = menu.addAction(tr("menu_edit_selected_tags", count=len(selected))) if is_multi else None
         edit_action = menu.addAction(tr("menu_edit_tags"))
         media_info_action = menu.addAction(tr("menu_media_info"))
-        delete_action = menu.addAction(tr("menu_delete_from_device"))
+        # One delete action, not two: right-clicking a multi-selection and
+        # deleting means deleting the selection -- there is no useful
+        # "delete only the row I happened to right-click" reading of that
+        # gesture to offer alongside it, the way there is for editing (single
+        # track vs. album-style editor are genuinely different tools).
+        delete_action = menu.addAction(
+            tr("menu_delete_selected_from_device", count=len(selected)) if is_multi else tr("menu_delete_from_device")
+        )
         action = menu.exec(global_pos)
         if multi_edit_action and action == multi_edit_action:
             self._edit_device_tracks_as_album(selected)
@@ -1990,7 +2079,7 @@ class MainWindow(QMainWindow):
         elif action == media_info_action:
             self._show_media_info(device_track, from_device=True)
         elif action == delete_action:
-            self._delete_device_track(device_track)
+            self._confirm_and_delete_device_tracks(selected if is_multi else [device_track])
 
     def _show_device_album_menu(self, global_pos, artist: str, album: str):
         menu = QMenu(self)
@@ -2009,34 +2098,59 @@ class MainWindow(QMainWindow):
         if action == delete_action:
             self._delete_device_artist(artist)
 
-    def _delete_device_track(self, device_track: Track):
-        if not self.selected_device:
+    def _confirm_and_delete_device_tracks(self, tracks: list[Track]):
+        """Ask once, then delete every track in `tracks` from the device.
+
+        The one-track and many-tracks cases share this instead of many-tracks
+        being built out of N single-track deletes: each delete used to
+        collapse the whole card's database into one open/write/close cycle
+        (see delete_many_from_device) precisely to avoid that, and confirming
+        once for "12 tracks" is also what the multi-edit menu action already
+        does one right-click above this one."""
+        if not tracks or not self.selected_device:
             return
-        reply = QMessageBox.question(
-            self,
-            tr("confirm_delete_device_title"),
-            tr("confirm_delete_device_text", title=device_track.title, mount=self.selected_device.mountpoint),
-        )
+        if len(tracks) == 1:
+            text = tr("confirm_delete_device_text", title=tracks[0].title, mount=self.selected_device.mountpoint)
+        else:
+            text = tr("confirm_delete_selected_from_device_text", count=len(tracks), mount=self.selected_device.mountpoint)
+        reply = QMessageBox.question(self, tr("confirm_delete_device_title"), text)
         if reply != QMessageBox.Yes:
             return
-
-        self._delete_device_tracks([device_track])
+        self._delete_device_tracks(tracks)
 
     def _show_track_menu(self, track: Track, tracks: list[Track], index: int, global_pos, selected: list[Track] | None = None):
         menu = QMenu(self)
         # Offered only when the right-clicked track is itself part of a
         # multi-track selection -- right-clicking outside the selection is a
         # gesture about that one row, not about what's highlighted elsewhere.
-        multi_edit_action = None
-        if selected and len(selected) > 1 and any(t.path == track.path for t in selected):
-            multi_edit_action = menu.addAction(tr("menu_edit_selected_tags", count=len(selected)))
+        is_multi = bool(selected) and len(selected) > 1 and any(t.path == track.path for t in selected)
+        multi_edit_action = menu.addAction(tr("menu_edit_selected_tags", count=len(selected))) if is_multi else None
         edit_action = menu.addAction(tr("menu_edit_tags"))
         media_info_action = menu.addAction(tr("menu_media_info"))
         sync_action = menu.addAction(tr("menu_sync_track"))
+
+        # "Delete from device" is offered only when every relevant track is
+        # actually on the device: for a single right-click that's the usual
+        # per-track check; for a selection, every highlighted track has to be
+        # there too, or "delete the selected tracks from the device" would
+        # silently skip whichever ones were never synced.
+        on_device = (
+            all(t.source_hash in self.device_hashes for t in selected)
+            if is_multi
+            else track.source_hash in self.device_hashes
+        )
         delete_device_action = None
-        if self.selected_device and track.source_hash in self.device_hashes:
-            delete_device_action = menu.addAction(tr("menu_delete_from_device"))
-        delete_action = menu.addAction(tr("menu_delete_track"))
+        if self.selected_device and on_device:
+            delete_device_action = menu.addAction(
+                tr("menu_delete_selected_from_device", count=len(selected)) if is_multi else tr("menu_delete_from_device")
+            )
+
+        # One delete-from-library action, covering the whole selection when
+        # there is one -- see the identical reasoning on the device panel's
+        # own context menu.
+        delete_action = menu.addAction(
+            tr("menu_delete_selected_tracks", count=len(selected)) if is_multi else tr("menu_delete_track")
+        )
 
         action = menu.exec(global_pos)
         if multi_edit_action and action == multi_edit_action:
@@ -2048,9 +2162,9 @@ class MainWindow(QMainWindow):
         elif action == sync_action:
             self._sync_tracks([track], tr("sync_track_description", title=track.title))
         elif delete_device_action and action == delete_device_action:
-            self._delete_from_device(track)
+            self._delete_from_device_tracks(selected if is_multi else [track])
         elif action == delete_action:
-            self._delete_library_track(track)
+            self._confirm_and_delete_library_tracks(selected if is_multi else [track])
 
     def _show_artist_menu(self, global_pos, artist: str):
         menu = QMenu(self)
@@ -2089,13 +2203,17 @@ class MainWindow(QMainWindow):
             self._persist_track_edit,
         )
 
-    def _delete_from_device(self, track: Track):
+    def _delete_from_device_tracks(self, tracks: list[Track]):
+        """Resolve library tracks to their device copies (by the source hash
+        the presence tick itself is matched on) and delete those copies."""
         if not self.selected_device or not self.device_db:
             return
-        device_track = self.device_db.get_by_source_hash(track.hash)
-        if not device_track:
-            return
-        self._delete_device_track(device_track)
+        device_tracks = [
+            device_track
+            for device_track in (self.device_db.get_by_source_hash(track.hash) for track in tracks)
+            if device_track is not None
+        ]
+        self._confirm_and_delete_device_tracks(device_tracks)
 
     # ---------- deletion ----------
 
@@ -2127,13 +2245,17 @@ class MainWindow(QMainWindow):
         if errors:
             QMessageBox.critical(self, tr("msg_delete_failed_title"), "\n".join(errors[:10]))
 
-    def _delete_library_track(self, track: Track):
-        reply = QMessageBox.question(
-            self, tr("confirm_delete_track_title"), tr("confirm_delete_track_text", title=track.title)
-        )
+    def _confirm_and_delete_library_tracks(self, tracks: list[Track]):
+        if not tracks:
+            return
+        if len(tracks) == 1:
+            text = tr("confirm_delete_track_text", title=tracks[0].title)
+        else:
+            text = tr("confirm_delete_selected_tracks_text", count=len(tracks))
+        reply = QMessageBox.question(self, tr("confirm_delete_track_title"), text)
         if reply != QMessageBox.Yes:
             return
-        self._delete_library_tracks([track])
+        self._delete_library_tracks(tracks)
 
     def _delete_library_album(self, artist: str, album: str):
         tracks = self._tracks_for_album(artist, album)
